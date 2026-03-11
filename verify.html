@@ -1,0 +1,186 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>BLAKE3 streaming verifier</title>
+    <style>
+     body { font-family: system-ui, sans-serif; margin: 24px; }
+     pre { background: #111; color: #0f0; padding: 16px; white-space: pre-wrap; }
+     button { margin-right: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>BLAKE3 streaming verifier</h1>
+    <p>
+      <button id="run-self-tests">Run self-tests</button>
+      <input id="pick-file" type="file" />
+      <button id="run-file-test">Verify selected file</button>
+    </p>
+    <pre id="log"></pre>
+
+    <script type="module">
+     import { StreamingHasher } from './streaming-hasher.js';
+     import wasmInit, * as wasm from './pkg/blake3_wasm_streaming.js';
+
+     const logEl = document.getElementById('log');
+     const wasmReady = wasmInit();
+
+     function log(...args) {
+       const line = args.map(String).join(' ');
+       console.log(line);
+       logEl.textContent += line + '\n';
+     }
+
+     function hex(u8) {
+       return Array.from(u8, b => b.toString(16).padStart(2, '0')).join('');
+     }
+
+     async function wholeMessageHash(bytes) {
+       await wasmReady;
+       return new Uint8Array(wasm.hash_whole_message_root_bytes(bytes));
+     }
+     
+     function makeDeterministicBytes(size) {
+       const out = new Uint8Array(size);
+       let x = 0x12345678;
+       for (let i = 0; i < size; i++) {
+         x = (1664525 * x + 1013904223) >>> 0;
+         out[i] = x >>> 24;
+       }
+       return out;
+     }
+
+     function assert(cond, msg) {
+       if (!cond) throw new Error(msg);
+     }
+
+     async function verifyBlob(hasher, blob, label) {
+       const allBytes = new Uint8Array(await blob.arrayBuffer());
+       const expected = await wholeMessageHash(allBytes);
+
+       let callbackCount = 0;
+       let lastRead = 0;
+       let lastHashed = 0;
+
+       const { hash, timeMs } = await hasher.hashFileStreaming(blob, (p) => {
+         callbackCount++;
+
+         assert(p.bytesRead >= lastRead, `${label}: bytesRead went backwards`);
+         assert(p.bytesHashed >= lastHashed, `${label}: bytesHashed went backwards`);
+         assert(p.bytesRead <= p.totalBytes, `${label}: bytesRead exceeded totalBytes`);
+         assert(p.bytesHashed <= p.totalBytes, `${label}: bytesHashed exceeded totalBytes`);
+
+         lastRead = p.bytesRead;
+         lastHashed = p.bytesHashed;
+       });
+
+       const actualHex = hex(hash);
+       const expectedHex = hex(expected);
+
+       assert(actualHex === expectedHex,
+              `${label}: hash mismatch\nexpected ${expectedHex}\nactual   ${actualHex}`);
+
+       assert(lastRead === blob.size, `${label}: final bytesRead != size`);
+       assert(lastHashed === blob.size, `${label}: final bytesHashed != size`);
+       assert(callbackCount >= 1, `${label}: progress callback never fired`);
+
+       log(`PASS ${label} size=${blob.size} time=${timeMs.toFixed(2)}ms hash=${actualHex}`);
+     }
+
+     async function runSelfTests() {
+       logEl.textContent = '';
+       log('Initializing...');
+
+       // For verification, use a small leaf size so tree cases happen with small files.
+       // In this code, "chunkSize" is effectively the planned leaf size.
+       const hasher = new StreamingHasher({
+         workerCount: 2,
+         chunkSize: 4096,
+         bufferBudget: 16384,
+       });
+
+       await hasher.init();
+       log('Hasher initialized.');
+
+       const sizes = [
+         0,
+         1,
+         2,
+         31,
+         32,
+         33,
+         1023,
+         1024,
+         1025,
+         2047,
+         2048,
+         2049,
+         4095,
+         4096,
+         4097,
+         8191,
+         8192,
+         8193,
+         16384 + 333,
+         65536 + 17,
+       ];
+
+       try {
+         for (const size of sizes) {
+           const bytes = makeDeterministicBytes(size);
+           const blob = new Blob([bytes], { type: 'application/octet-stream' });
+           await verifyBlob(hasher, blob, `generated-${size}`);
+         }
+
+         // A few randomized sizes
+         for (let i = 0; i < 10; i++) {
+           const size = Math.floor(Math.random() * 200000);
+           const bytes = makeDeterministicBytes(size);
+           const blob = new Blob([bytes], { type: 'application/octet-stream' });
+           await verifyBlob(hasher, blob, `random-${i}-${size}`);
+         }
+
+         log('ALL SELF-TESTS PASSED');
+       } catch (err) {
+         log('FAIL:', err?.stack || err);
+       } finally {
+         hasher.terminate();
+       }
+     }
+
+     async function runSelectedFileTest() {
+       logEl.textContent = '';
+       const input = document.getElementById('pick-file');
+       const file = input.files[0];
+       if (!file) {
+         log('Pick a file first.');
+         return;
+       }
+
+       const hasher = new StreamingHasher({
+         workerCount: 2,
+         chunkSize: 4096,
+         bufferBudget: 16384,
+       });
+
+       try {
+         await hasher.init();
+         await verifyBlob(hasher, file, `file:${file.name}`);
+         log('SELECTED FILE PASSED');
+       } catch (err) {
+         log('FAIL:', err?.stack || err);
+       } finally {
+         hasher.terminate();
+       }
+     }
+
+     document.getElementById('run-self-tests').onclick = () => {
+       runSelfTests();
+     };
+
+     document.getElementById('run-file-test').onclick = () => {
+       runSelectedFileTest();
+     };
+    </script>
+  </body>
+</html>

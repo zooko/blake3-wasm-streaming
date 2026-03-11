@@ -86,7 +86,7 @@ pub fn hash_whole_message_root_from_ptr(
     out_ptr: u32,
 ) {
     let input = unsafe { read_input(input_ptr, input_len) };
-    let hash = blake3::hash_subtree_output(input, 0).root_hash();
+    let hash = blake3::hash(input);
     unsafe { write_hash(out_ptr, &hash) };
 }
 
@@ -106,4 +106,41 @@ pub fn root_hash_from_ptrs(left_ptr: u32, right_ptr: u32, out_ptr: u32) {
     let right = unsafe { read_cv(right_ptr) };
     let out = blake3::root_hash(&left, &right);
     unsafe { write_hash(out_ptr, &out) };
+}
+
+#[wasm_bindgen]
+pub fn hash_subtree_cv_bytes(input: &[u8], offset_lo: u32, offset_hi: u32) -> Vec<u8> {
+    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
+    blake3::hash_subtree_cv(input, input_offset).to_vec()
+}
+
+#[wasm_bindgen]
+pub fn hash_whole_message_root_bytes(input: &[u8]) -> Vec<u8> {
+    blake3::hash(input).as_bytes().to_vec()
+}
+
+#[wasm_bindgen]
+pub fn parent_cv_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
+    assert_eq!(left.len(), OUT_LEN, "left child CV must be 32 bytes");
+    assert_eq!(right.len(), OUT_LEN, "right child CV must be 32 bytes");
+
+    let mut left_arr = [0u8; OUT_LEN];
+    let mut right_arr = [0u8; OUT_LEN];
+    left_arr.copy_from_slice(left);
+    right_arr.copy_from_slice(right);
+
+    blake3::parent_cv(&left_arr, &right_arr).to_vec()
+}
+
+#[wasm_bindgen]
+pub fn root_hash_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
+    assert_eq!(left.len(), OUT_LEN, "left child CV must be 32 bytes");
+    assert_eq!(right.len(), OUT_LEN, "right child CV must be 32 bytes");
+
+    let mut left_arr = [0u8; OUT_LEN];
+    let mut right_arr = [0u8; OUT_LEN];
+    left_arr.copy_from_slice(left);
+    right_arr.copy_from_slice(right);
+
+    blake3::root_hash(&left_arr, &right_arr).as_bytes().to_vec()
 }
