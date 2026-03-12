@@ -75,6 +75,58 @@ pub fn hash_subtree_cv_from_ptr(
     unsafe { write32(out_ptr, &cv) };
 }
 
+#[wasm_bindgen]
+pub fn hash_subtree_cv_via_hasher_from_ptr(
+    input_ptr: u32,
+    input_len: u32,
+    offset_lo: u32,
+    offset_hi: u32,
+    out_ptr: u32,
+) {
+    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
+    let input = unsafe { read_input(input_ptr, input_len) };
+    let cv = hash_subtree_cv_via_hasher(input, input_offset);
+    unsafe { write32(out_ptr, &cv) };
+}
+
+#[wasm_bindgen]
+pub fn repeat_hash_subtree_cv_from_ptr(
+    input_ptr: u32,
+    input_len: u32,
+    offset_lo: u32,
+    offset_hi: u32,
+    reps: u32,
+    out_ptr: u32,
+) {
+    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
+    let input = unsafe { read_input(input_ptr, input_len) };
+    let mut cv = [0u8; OUT_LEN];
+    for _ in 0..reps {
+        cv = blake3::hash_subtree_cv(input, input_offset);
+    }
+    unsafe { write32(out_ptr, &cv) };
+}
+
+#[wasm_bindgen]
+pub fn repeat_hash_subtree_cv_via_hasher_from_ptr(
+    input_ptr: u32,
+    input_len: u32,
+    offset_lo: u32,
+    offset_hi: u32,
+    reps: u32,
+    out_ptr: u32,
+) {
+    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
+    let input = unsafe { read_input(input_ptr, input_len) };
+    let mut cv = [0u8; OUT_LEN];
+    for _ in 0..reps {
+        cv = hash_subtree_cv_via_hasher(input, input_offset);
+    }
+    unsafe { write32(out_ptr, &cv) };
+}
+
+use blake3::hazmat::HasherExt;
+
 /// Hash the entire message at `input_ptr,input_len` and write the final 32-byte root hash.
 ///
 /// This should only be used when the bytes at `input_ptr..input_ptr+input_len` are the
@@ -143,4 +195,12 @@ pub fn root_hash_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
     right_arr.copy_from_slice(right);
 
     blake3::root_hash(&left_arr, &right_arr).as_bytes().to_vec()
+}
+
+#[inline]
+fn hash_subtree_cv_via_hasher(input: &[u8], input_offset: u64) -> [u8; OUT_LEN] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.set_input_offset(input_offset);
+    hasher.update(input);
+    hasher.finalize_non_root()
 }
