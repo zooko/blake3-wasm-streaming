@@ -1,12 +1,11 @@
 use std::{mem, ptr, slice};
+
+use blake3::hazmat::HasherExt;
+use blake3::{Hasher, OUT_LEN};
 use wasm_bindgen::prelude::*;
 
-const OUT_LEN: usize = 32;
-
-#[inline]
-fn u64_from_lo_hi(lo: u32, hi: u32) -> u64 {
-    (lo as u64) | ((hi as u64) << 32)
-}
+pub const PARCEL_LEN: usize = 64 * 1024;
+pub const CV_LEN: usize = OUT_LEN;
 
 #[inline]
 unsafe fn read_input<'a>(ptr_u32: u32, len_u32: u32) -> &'a [u8] {
@@ -57,86 +56,60 @@ pub fn out_len() -> u32 {
     OUT_LEN as u32
 }
 
-/// Hash a legal non-root subtree at `input_offset` and write its 32-byte CV to `out_ptr`.
+/// Hash each 64 KiB parcel in `input` to a non-root CV and write the CVs
+/// consecutively into `out`.
 ///
-/// Panics if the subtree is illegal for that offset; that is intentional, matching the
-/// low-level core API contract.
-#[wasm_bindgen]
-pub fn hash_subtree_cv_from_ptr(
-    input_ptr: u32,
-    input_len: u32,
-    offset_lo: u32,
-    offset_hi: u32,
-    out_ptr: u32,
-) {
-    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
-    let input = unsafe { read_input(input_ptr, input_len) };
-    let cv = blake3::hash_subtree_cv(input, input_offset);
-    unsafe { write32(out_ptr, &cv) };
-}
-
-#[wasm_bindgen]
-pub fn hash_subtree_cv_via_hasher_from_ptr(
-    input_ptr: u32,
-    input_len: u32,
-    offset_lo: u32,
-    offset_hi: u32,
-    out_ptr: u32,
-) {
-    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
-    let input = unsafe { read_input(input_ptr, input_len) };
-    let cv = hash_subtree_cv_via_hasher(input, input_offset);
-    unsafe { write32(out_ptr, &cv) };
-}
-
-#[wasm_bindgen]
-pub fn repeat_hash_subtree_cv_from_ptr(
-    input_ptr: u32,
-    input_len: u32,
-    offset_lo: u32,
-    offset_hi: u32,
-    reps: u32,
-    out_ptr: u32,
-) {
-    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
-    let input = unsafe { read_input(input_ptr, input_len) };
-    let mut cv = [0u8; OUT_LEN];
-    for _ in 0..reps {
-        cv = blake3::hash_subtree_cv(input, input_offset);
-    }
-    unsafe { write32(out_ptr, &cv) };
-}
-
-#[wasm_bindgen]
-pub fn repeat_hash_subtree_cv_via_hasher_from_ptr(
-    input_ptr: u32,
-    input_len: u32,
-    offset_lo: u32,
-    offset_hi: u32,
-    reps: u32,
-    out_ptr: u32,
-) {
-    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
-    let input = unsafe { read_input(input_ptr, input_len) };
-    let mut cv = [0u8; OUT_LEN];
-    for _ in 0..reps {
-        cv = hash_subtree_cv_via_hasher(input, input_offset);
-    }
-    unsafe { write32(out_ptr, &cv) };
-}
-
-use blake3::hazmat::HasherExt;
-
-/// Hash the entire message at `input_ptr,input_len` and write the final 32-byte root hash.
+/// Parcel i writes to:
+///   out[i * 32 .. (i + 1) * 32]
 ///
-/// This should only be used when the bytes at `input_ptr..input_ptr+input_len` are the
-/// whole message, not an internal subtree.
+/// Parcel i is hashed at logical BLAKE3 offset:
+///   input_offset + i * 64 KiB
+///
+/// Returns the number of CVs written.
+///
+/// Strict version:
+/// - `input.len()` must be a multiple of 64 KiB
+/// - `out.len()` must be at least num_parcels * 32
+pub fn hash_64k_parcel_cvs(input: &[u8], out: &mut [u8], input_offset: u64) -> usize {
+    debug_assert!(input.len().is_multiple_of(PARCEL_LEN), "input length must be a multiple of 64 KiB");
+    debug_assert!(u64::MAX - input.len() - input_offset >= 0, "logical BLAKE3 offset overflow");
+
+    let num_parcels = input.len() / PARCEL_LEN;
+    let needed_out = num_parcels * CV_LEN;
+
+    debug_assert!(out.len() >= needed_out, "output buffer too small: need {} bytes, got {}", needed_out, out.len());
+
+    for (i, parcel) in input.chunks_exact(PARCEL_LEN).enumerate() {
+        let parcel_offset = input_offset.wrapping_add((i as u64) * (PARCEL_LEN as u64));
+
+        let mut hasher = Hasher::new();
+        hasher.set_input_offset(parcel_offset);
+        hasher.update(parcel);
+        let cv = hasher.finalize_non_root();
+
+        unsafe {
+            ptr::copy_nonoverlapping(cv.as_ptr(), out.as_mut_ptr().add(i * CV_LEN), CV_LEN);
+        }
+    }
+
+    num_parcels
+}
+
 #[wasm_bindgen]
-pub fn hash_whole_message_root_from_ptr(
+pub fn hash_64k_parcel_cvs_from_ptr(
     input_ptr: u32,
     input_len: u32,
+    input_offset: u64,
     out_ptr: u32,
-) {
+    out_len: u32,
+) -> u32 {
+    let input = unsafe { slice::from_raw_parts(input_ptr as *const u8, input_len as usize) };
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr as *mut u8, out_len as usize) };
+    hash_64k_parcel_cvs(input, out, input_offset) as u32
+}
+
+#[wasm_bindgen]
+pub fn hash_whole_message_root_from_ptr(input_ptr: u32, input_len: u32, out_ptr: u32) {
     let input = unsafe { read_input(input_ptr, input_len) };
     let hash = blake3::hash(input);
     unsafe { write_hash(out_ptr, &hash) };
@@ -158,49 +131,4 @@ pub fn root_hash_from_ptrs(left_ptr: u32, right_ptr: u32, out_ptr: u32) {
     let right = unsafe { read_cv(right_ptr) };
     let out = blake3::root_hash(&left, &right);
     unsafe { write_hash(out_ptr, &out) };
-}
-
-#[wasm_bindgen]
-pub fn hash_subtree_cv_bytes(input: &[u8], offset_lo: u32, offset_hi: u32) -> Vec<u8> {
-    let input_offset = u64_from_lo_hi(offset_lo, offset_hi);
-    blake3::hash_subtree_cv(input, input_offset).to_vec()
-}
-
-#[wasm_bindgen]
-pub fn hash_whole_message_root_bytes(input: &[u8]) -> Vec<u8> {
-    blake3::hash(input).as_bytes().to_vec()
-}
-
-#[wasm_bindgen]
-pub fn parent_cv_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
-    assert_eq!(left.len(), OUT_LEN, "left child CV must be 32 bytes");
-    assert_eq!(right.len(), OUT_LEN, "right child CV must be 32 bytes");
-
-    let mut left_arr = [0u8; OUT_LEN];
-    let mut right_arr = [0u8; OUT_LEN];
-    left_arr.copy_from_slice(left);
-    right_arr.copy_from_slice(right);
-
-    blake3::parent_cv(&left_arr, &right_arr).to_vec()
-}
-
-#[wasm_bindgen]
-pub fn root_hash_bytes(left: &[u8], right: &[u8]) -> Vec<u8> {
-    assert_eq!(left.len(), OUT_LEN, "left child CV must be 32 bytes");
-    assert_eq!(right.len(), OUT_LEN, "right child CV must be 32 bytes");
-
-    let mut left_arr = [0u8; OUT_LEN];
-    let mut right_arr = [0u8; OUT_LEN];
-    left_arr.copy_from_slice(left);
-    right_arr.copy_from_slice(right);
-
-    blake3::root_hash(&left_arr, &right_arr).as_bytes().to_vec()
-}
-
-#[inline]
-fn hash_subtree_cv_via_hasher(input: &[u8], input_offset: u64) -> [u8; OUT_LEN] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.set_input_offset(input_offset);
-    hasher.update(input);
-    hasher.finalize_non_root()
 }
