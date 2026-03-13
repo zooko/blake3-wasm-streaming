@@ -1,643 +1,354 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>BLAKE3 WASM Benchmark</title>
-
-    <!-- Keep this if the lamb356 shared-memory build needs cross-origin isolation -->
-    <script src="./coi-serviceworker.min.js"></script>
-
-    <style>
-     body {
-       font-family: monospace;
-       max-width: 1200px;
-       margin: 2em auto;
-       background: #111827;
-       color: #e5e7eb;
-       padding: 0 1em;
-     }
-
-     h1, h2 {
-       color: #67e8f9;
-     }
-
-     p.note {
-       color: #9ca3af;
-     }
-
-     button {
-       font-size: 1rem;
-       padding: 0.7em 1.2em;
-       cursor: pointer;
-       background: #22d3ee;
-       color: #000;
-       border: none;
-       border-radius: 6px;
-       font-family: monospace;
-       font-weight: bold;
-       margin-bottom: 1em;
-     }
-
-     button:disabled {
-       opacity: 0.5;
-       cursor: not-allowed;
-     }
-
-     #sysinfo {
-       color: #9ca3af;
-       margin: 1em 0;
-       font-size: 0.95em;
-     }
-
-     #log {
-       margin-top: 1em;
-       padding: 1em;
-       background: #0b1220;
-       border-radius: 8px;
-       max-height: 320px;
-       overflow-y: auto;
-       border: 1px solid #1f2937;
-       font-size: 0.9em;
-     }
-
-     .log-line {
-       margin: 0.2em 0;
-       white-space: pre-wrap;
-     }
-
-     .section {
-       margin-top: 2em;
-     }
-
-     .section-subtitle {
-       color: #9ca3af;
-       margin-top: -0.5em;
-       margin-bottom: 0.8em;
-     }
-
-     table {
-       border-collapse: collapse;
-       width: 100%;
-       margin: 1em 0 2em 0;
-       background: #0b1220;
-     }
-
-     th, td {
-       border: 1px solid #1f2937;
-       padding: 8px 10px;
-       text-align: left;
-       vertical-align: top;
-     }
-
-     th {
-       background: #111827;
-       color: #67e8f9;
-     }
-
-     tr:nth-child(even) td {
-       background: #0f172a;
-     }
-
-     .ok {
-       color: #22c55e;
-       font-weight: bold;
-     }
-
-     .bad {
-       color: #ef4444;
-       font-weight: bold;
-     }
-
-     .slower {
-       color: #f87171;
-       font-weight: bold;
-     }
-
-     .faster {
-       color: #4ade80;
-       font-weight: bold;
-     }
-
-     .neutral {
-       color: #d1d5db;
-     }
-
-     .small {
-       color: #9ca3af;
-       font-size: 0.92em;
-     }
-
-     .mono {
-       font-family: monospace;
-     }
-
-     .codeish {
-       color: #c4b5fd;
-     }
-    </style>
-  </head>
-  <body>
-    <h1>BLAKE3 WASM Benchmark</h1>
-
-    <p>
-      Compares:
-    </p>
-    <ul>
-      <li><span class="codeish">poke_only</span>: raw JS writes into WASM memory</li>
-      <li><span class="codeish">hash_subtree_ptr</span>: your low-level pointer hash vs lamb356 low-level pointer hash</li>
-      <li><span class="codeish">rust_path_compare</span>: inside your build only, public subtree helper path vs Hasher path</li>
-    </ul>
-
-    <p class="note">
-      Status meanings:
-      <b>OK</b> = benchmark ran successfully,
-      <b>MATCH</b> = outputs matched,
-      <b>MISMATCH</b> = outputs differed.
-    </p>
-
-    <div id="sysinfo"></div>
-
-    <button id="run-btn">Run Benchmarks</button>
-
-    <div id="results"></div>
-
-    <h2>Log</h2>
-    <div id="log"></div>
-
-    <script type="module">
-     const runBtn = document.getElementById('run-btn');
-     const resultsEl = document.getElementById('results');
-     const logEl = document.getElementById('log');
-     const sysinfoEl = document.getElementById('sysinfo');
-
-     const BUILD_ID = 'build20260312c'; // bump this whenever you rebuild
-
-     let myPkg;
-     let hisPkg;
-     let initMy;
-     let initHis;
-     let myWasm;
-     let hisWasm;
-
-     // Includes one size in each iteration bucket:
-     // < 32 KiB => 100_000
-     // >= 32 KiB and < 128 KiB => 10_000
-     // >= 128 KiB => 1_000
-     const SIZES = [
-       { label: '16 KiB', bytes: 16 * 1024 },
-       { label: '64 KiB', bytes: 64 * 1024 },
-       { label: '1 MiB', bytes: 1024 * 1024 },
-     ];
-
-     const WARMUP = 20;
-
-     sysinfoEl.innerHTML = [
-       `Platform: ${navigator.platform}`,
-       `Cores: ${navigator.hardwareConcurrency}`,
-       `Cross-Origin Isolated: ${typeof SharedArrayBuffer !== 'undefined' ? '<span class="ok">YES</span>' : '<span class="bad">NO</span>'}`,
-       `UA: ${navigator.userAgent.slice(0, 140)}`
-     ].join(' | ');
-
-     function log(msg) {
-       const div = document.createElement('div');
-       div.className = 'log-line';
-       div.textContent = `[${performance.now().toFixed(1)}ms] ${msg}`;
-       logEl.appendChild(div);
-       logEl.scrollTop = logEl.scrollHeight;
-       console.log(msg);
-     }
-
-     function requireFunction(obj, name, label) {
-       if (typeof obj[name] !== 'function') {
-         throw new Error(`Missing export ${name} in ${label}`);
-       }
-     }
-
-     function hex(bytes) {
-       return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-     }
-
-     function arraysEqual(a, b) {
-       if (a.length !== b.length) return false;
-       for (let i = 0; i < a.length; i++) {
-         if (a[i] !== b[i]) return false;
-       }
-       return true;
-     }
-
-     function makeData(bytes) {
-       const out = new Uint8Array(bytes);
-       for (let i = 0; i < bytes; i++) {
-         out[i] = i & 0xff;
-       }
-       return out;
-     }
-
-     function iterationsForSize(bytes) {
-       if (bytes < 32 * 1024) return 100_000;
-       if (bytes < 128 * 1024) return 10_000;
-       return 1_000;
-     }
-
-     function meanMs(iterations, fn) {
-       const t0 = performance.now();
-       for (let i = 0; i < iterations; i++) {
-         fn();
-       }
-       const total = performance.now() - t0;
-       return total / iterations;
-     }
-
-     function timeOnceMs(fn) {
-       const t0 = performance.now();
-       fn();
-       return performance.now() - t0;
-     }
-
-     function fmtMs(ms) {
-       if (ms < 0.001) return ms.toFixed(6);
-       if (ms < 0.01) return ms.toFixed(5);
-       if (ms < 0.1) return ms.toFixed(4);
-       return ms.toFixed(3);
-     }
-
-     function diffPct(a, b) {
-       if (b === 0) return 0;
-       return ((a - b) / b) * 100;
-     }
-
-     function fmtPct(pct) {
-       const sign = pct > 0 ? '+' : '';
-       return `${sign}${pct.toFixed(1)}%`;
-     }
-
-     function diffClass(pct) {
-       if (pct > 1) return 'slower';
-       if (pct < -1) return 'faster';
-       return 'neutral';
-     }
-
-     async function initModules() {
-       // Resolve URLs relative to bench/index.html
-       const myJsUrl = new URL(`../pkg/blake3_wasm_streaming.js?v=${BUILD_ID}`, import.meta.url);
-       const myWasmUrl = new URL(`../pkg/blake3_wasm_streaming_bg.wasm?v=${BUILD_ID}`, import.meta.url);
-
-       const hisJsUrl = new URL(
-         `../../lamb356-blake3-wasm/blake3-wasm-shared/pkg/blake3_wasm_shared.js?v=${BUILD_ID}`,
-         import.meta.url
-       );
-       const hisWasmUrl = new URL(
-         `../../lamb356-blake3-wasm/blake3-wasm-shared/pkg/blake3_wasm_shared_bg.wasm?v=${BUILD_ID}`,
-         import.meta.url
-       );
-
-       log(`BUILD_ID = ${BUILD_ID}`);
-       log(`Your JS shim URL: ${myJsUrl.href}`);
-       log(`Your WASM URL: ${myWasmUrl.href}`);
-       log(`lamb356 JS shim URL: ${hisJsUrl.href}`);
-       log(`lamb356 WASM URL: ${hisWasmUrl.href}`);
-
-       log('Importing your JS shim...');
-       const myMod = await import(myJsUrl.href);
-       initMy = myMod.default;
-       myPkg = myMod;
-
-       log('Importing lamb356 JS shim...');
-       const hisMod = await import(hisJsUrl.href);
-       initHis = hisMod.default;
-       hisPkg = hisMod;
-
-       log('Initializing your module...');
-       myWasm = await initMy(myWasmUrl);
-       log(`Your module ready. Memory size: ${myWasm.memory.buffer.byteLength} bytes`);
-
-       log('Initializing lamb356 module...');
-       hisWasm = await initHis(hisWasmUrl);
-       log(`lamb356 module ready. Memory size: ${hisWasm.memory.buffer.byteLength} bytes`);
-
-       log(`Your exports: ${Object.keys(myPkg).sort().join(', ')}`);
-       log(`lamb356 exports: ${Object.keys(hisPkg).sort().join(', ')}`);
-
-       // Existing/basic exports
-       requireFunction(myPkg, 'alloc', 'your pkg');
-       requireFunction(myPkg, 'dealloc', 'your pkg');
-       requireFunction(myPkg, 'hash_subtree_cv_from_ptr', 'your pkg');
-
-       requireFunction(hisPkg, 'alloc_input', 'lamb356 pkg');
-       requireFunction(hisPkg, 'free_input', 'lamb356 pkg');
-       requireFunction(hisPkg, 'hash_subtree_ptr_into', 'lamb356 pkg');
-
-       // New exports for Rust-path A/B
-       requireFunction(myPkg, 'hash_subtree_cv_via_hasher_from_ptr', 'your pkg');
-       requireFunction(myPkg, 'repeat_hash_subtree_cv_from_ptr', 'your pkg');
-       requireFunction(myPkg, 'repeat_hash_subtree_cv_via_hasher_from_ptr', 'your pkg');
-     }
-
-     function benchPokeOnly(bytes) {
-       const iterations = iterationsForSize(bytes);
-       const data = makeData(bytes);
-
-       const myPtr = myPkg.alloc(bytes);
-       const hisPtr = hisPkg.alloc_input(bytes);
-
-       const myHeap = new Uint8Array(myWasm.memory.buffer);
-       const hisHeap = new Uint8Array(hisWasm.memory.buffer);
-
-       for (let i = 0; i < WARMUP; i++) {
-         myHeap.set(data, myPtr);
-         hisHeap.set(data, hisPtr);
-       }
-
-       const myMs = meanMs(iterations, () => {
-         myHeap.set(data, myPtr);
-       });
-
-       const hisMs = meanMs(iterations, () => {
-         hisHeap.set(data, hisPtr);
-       });
-
-       myPkg.dealloc(myPtr, bytes);
-       hisPkg.free_input(hisPtr, bytes);
-
-       return {
-         operation: 'poke_only',
-         bytes,
-         iterations,
-         myMs,
-         hisMs,
-         diff: diffPct(myMs, hisMs),
-         status: 'OK',
-       };
-     }
-
-     function benchHashSubtreePtr(bytes) {
-       const iterations = iterationsForSize(bytes);
-       const data = makeData(bytes);
-
-       const myInPtr = myPkg.alloc(bytes);
-       const myOutPtr = myPkg.alloc(32);
-
-       const hisInPtr = hisPkg.alloc_input(bytes);
-       const hisOutPtr = hisPkg.alloc_input(32);
-
-       new Uint8Array(myWasm.memory.buffer).set(data, myInPtr);
-       new Uint8Array(hisWasm.memory.buffer).set(data, hisInPtr);
-
-       for (let i = 0; i < WARMUP; i++) {
-         myPkg.hash_subtree_cv_from_ptr(myInPtr, bytes, 0, 0, myOutPtr);
-         hisPkg.hash_subtree_ptr_into(hisInPtr, bytes, 0n, hisOutPtr);
-       }
-
-       const myMs = meanMs(iterations, () => {
-         myPkg.hash_subtree_cv_from_ptr(myInPtr, bytes, 0, 0, myOutPtr);
-       });
-
-       const hisMs = meanMs(iterations, () => {
-         hisPkg.hash_subtree_ptr_into(hisInPtr, bytes, 0n, hisOutPtr);
-       });
-
-       const myHash = new Uint8Array(myWasm.memory.buffer, myOutPtr, 32).slice();
-       const hisHash = new Uint8Array(hisWasm.memory.buffer, hisOutPtr, 32).slice();
-       const match = arraysEqual(myHash, hisHash);
-
-       if (!match) {
-         log(`MISMATCH for hash_subtree_ptr ${bytes} bytes`);
-         log(`  yours   = ${hex(myHash)}`);
-         log(`  lamb356 = ${hex(hisHash)}`);
-       }
-
-       myPkg.dealloc(myOutPtr, 32);
-       myPkg.dealloc(myInPtr, bytes);
-       hisPkg.free_input(hisOutPtr, 32);
-       hisPkg.free_input(hisInPtr, bytes);
-
-       return {
-         operation: 'hash_subtree_ptr',
-         bytes,
-         iterations,
-         myMs,
-         hisMs,
-         diff: diffPct(myMs, hisMs),
-         status: match ? 'MATCH' : 'MISMATCH',
-       };
-     }
-
-     function benchRustPathCompare(bytes) {
-       const iterations = iterationsForSize(bytes);
-       const data = makeData(bytes);
-
-       const inPtr = myPkg.alloc(bytes);
-       const outPublic = myPkg.alloc(32);
-       const outHasher = myPkg.alloc(32);
-
-       new Uint8Array(myWasm.memory.buffer).set(data, inPtr);
-
-       const warmReps = Math.max(1, Math.min(100, iterations));
-
-       for (let i = 0; i < WARMUP; i++) {
-         myPkg.repeat_hash_subtree_cv_from_ptr(inPtr, bytes, 0, 0, warmReps, outPublic);
-         myPkg.repeat_hash_subtree_cv_via_hasher_from_ptr(inPtr, bytes, 0, 0, warmReps, outHasher);
-       }
-
-       const publicTotalMs = timeOnceMs(() => {
-         myPkg.repeat_hash_subtree_cv_from_ptr(inPtr, bytes, 0, 0, iterations, outPublic);
-       });
-
-       const hasherTotalMs = timeOnceMs(() => {
-         myPkg.repeat_hash_subtree_cv_via_hasher_from_ptr(inPtr, bytes, 0, 0, iterations, outHasher);
-       });
-
-       const publicMs = publicTotalMs / iterations;
-       const hasherMs = hasherTotalMs / iterations;
-
-       const publicHash = new Uint8Array(myWasm.memory.buffer, outPublic, 32).slice();
-       const hasherHash = new Uint8Array(myWasm.memory.buffer, outHasher, 32).slice();
-       const match = arraysEqual(publicHash, hasherHash);
-
-       if (!match) {
-         log(`MISMATCH for rust_path_compare ${bytes} bytes`);
-         log(`  public helper = ${hex(publicHash)}`);
-         log(`  via hasher    = ${hex(hasherHash)}`);
-       }
-
-       myPkg.dealloc(outHasher, 32);
-       myPkg.dealloc(outPublic, 32);
-       myPkg.dealloc(inPtr, bytes);
-
-       return {
-         operation: 'rust_path_compare',
-         bytes,
-         iterations,
-         publicMs,
-         hasherMs,
-         diff: diffPct(publicMs, hasherMs),
-         status: match ? 'MATCH' : 'MISMATCH',
-       };
-     }
-
-     function renderSectionTable(title, subtitle, headers, rowsHtml) {
-       return `
-        <div class="section">
-          <h2>${title}</h2>
-          <div class="section-subtitle">${subtitle}</div>
-          <table>
-            <thead>
-              <tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>
-            </thead>
-            <tbody>
-              ${rowsHtml}
-            </tbody>
-          </table>
-        </div>
-              `;
-     }
-
-     function renderResults(groups) {
-       const pokeRows = groups.pokes.map(r => {
-         const diffCls = diffClass(r.diff);
-         const statusCls = r.status === 'OK' ? 'ok' : 'bad';
-         const sizeLabel = SIZES.find(s => s.bytes === r.bytes)?.label || `${r.bytes} bytes`;
-         return `
-          <tr>
-            <td>${sizeLabel}</td>
-            <td>${r.iterations.toLocaleString()}</td>
-            <td>${fmtMs(r.myMs)}</td>
-            <td>${fmtMs(r.hisMs)}</td>
-            <td class="${diffCls}">${fmtPct(r.diff)}</td>
-            <td class="${statusCls}">${r.status}</td>
-          </tr>
-         `;
-       }).join('');
-
-       const hashRows = groups.hashSubtrees.map(r => {
-         const diffCls = diffClass(r.diff);
-         const statusCls = r.status === 'MATCH' ? 'ok' : 'bad';
-         const sizeLabel = SIZES.find(s => s.bytes === r.bytes)?.label || `${r.bytes} bytes`;
-         return `
-          <tr>
-            <td>${sizeLabel}</td>
-            <td>${r.iterations.toLocaleString()}</td>
-            <td>${fmtMs(r.myMs)}</td>
-            <td>${fmtMs(r.hisMs)}</td>
-            <td class="${diffCls}">${fmtPct(r.diff)}</td>
-            <td class="${statusCls}">${r.status}</td>
-          </tr>
-         `;
-       }).join('');
-
-       const rustRows = groups.rustPaths.map(r => {
-         const diffCls = diffClass(r.diff);
-         const statusCls = r.status === 'MATCH' ? 'ok' : 'bad';
-         const sizeLabel = SIZES.find(s => s.bytes === r.bytes)?.label || `${r.bytes} bytes`;
-         return `
-          <tr>
-            <td>${sizeLabel}</td>
-            <td>${r.iterations.toLocaleString()}</td>
-            <td>${fmtMs(r.publicMs)}</td>
-            <td>${fmtMs(r.hasherMs)}</td>
-            <td class="${diffCls}">${fmtPct(r.diff)}</td>
-            <td class="${statusCls}">${r.status}</td>
-          </tr>
-         `;
-       }).join('');
-
-       resultsEl.innerHTML = [
-         renderSectionTable(
-           'poke_only',
-           'Raw JS writes into WASM memory. Positive diff means your build is slower than lamb356.',
-           [
-             'Size',
-             'Iterations',
-             'Your build (mean ms/call)',
-             'lamb356 (mean ms/call)',
-             'Your vs lamb356',
-             'Status'
-           ],
-           pokeRows
-         ),
-         renderSectionTable(
-           'hash_subtree_ptr',
-           'Low-level subtree hash only. Input bytes are preloaded before timing. Positive diff means your build is slower than lamb356.',
-           [
-             'Size',
-             'Iterations',
-             'Your build (mean ms/call)',
-             'lamb356 (mean ms/call)',
-             'Your vs lamb356',
-             'Status'
-           ],
-           hashRows
-         ),
-         renderSectionTable(
-           'rust_path_compare',
-           'Inside your build only: public subtree helper path vs Hasher path. Positive diff means public-helper path is slower than via-Hasher path.',
-           [
-             'Size',
-             'Iterations',
-             'public helper (mean ms/call)',
-             'via Hasher (mean ms/call)',
-             'Public vs Hasher',
-             'Status'
-           ],
-           rustRows
-         ),
-       ].join('');
-     }
-
-     async function runBenchmarks() {
-       runBtn.disabled = true;
-       logEl.innerHTML = '';
-       resultsEl.innerHTML = '<p class="note">Running...</p>';
-
-       try {
-         await initModules();
-
-         const groups = {
-           pokes: [],
-           hashSubtrees: [],
-           rustPaths: [],
-         };
-
-         log('--- poke_only ---');
-         for (const { label, bytes } of SIZES) {
-           const iters = iterationsForSize(bytes);
-           log(`poke_only ${label} (${iters.toLocaleString()} iterations)`);
-           const row = benchPokeOnly(bytes);
-           groups.pokes.push(row);
-           log(`  yours=${fmtMs(row.myMs)} ms/call, lamb356=${fmtMs(row.hisMs)} ms/call, diff=${fmtPct(row.diff)}, status=${row.status}`);
-         }
-
-         log('--- hash_subtree_ptr ---');
-         for (const { label, bytes } of SIZES) {
-           const iters = iterationsForSize(bytes);
-           log(`hash_subtree_ptr ${label} (${iters.toLocaleString()} iterations)`);
-           const row = benchHashSubtreePtr(bytes);
-           groups.hashSubtrees.push(row);
-           log(`  yours=${fmtMs(row.myMs)} ms/call, lamb356=${fmtMs(row.hisMs)} ms/call, diff=${fmtPct(row.diff)}, status=${row.status}`);
-         }
-
-         log('--- rust_path_compare ---');
-         for (const { label, bytes } of SIZES) {
-           const iters = iterationsForSize(bytes);
-           log(`rust_path_compare ${label} (${iters.toLocaleString()} iterations)`);
-           const row = benchRustPathCompare(bytes);
-           groups.rustPaths.push(row);
-           log(`  public=${fmtMs(row.publicMs)} ms/call, via_hasher=${fmtMs(row.hasherMs)} ms/call, diff=${fmtPct(row.diff)}, status=${row.status}`);
-         }
-
-         renderResults(groups);
-         log('Done.');
-       } catch (err) {
-         console.error(err);
-         log(`ERROR: ${err.message || err}`);
-         resultsEl.innerHTML = `<p class="bad">Error: ${err.message || err}</p>`;
-       } finally {
-         runBtn.disabled = false;
-       }
-     }
-
-     runBtn.addEventListener('click', runBenchmarks);
-    </script>
-  </body>
+<head>
+  <meta charset="UTF-8">
+  <title>BLAKE3 WASM Benchmark</title>
+  <style>
+    body { font-family: monospace; max-width: 1200px; margin: 2em auto;
+           background: #1a1a2e; color: #e0e0e0; padding: 0 1em; }
+    h1, h2 { color: #00d4ff; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th { background: #222; color: #00d4ff; text-align: left;
+         padding: 8px 12px; border: 1px solid #333; }
+    td { padding: 8px 12px; border: 1px solid #333; }
+    tr:nth-child(even) { background: #1e1e3a; }
+    .ok   { color: #0f0; font-weight: bold; }
+    .err  { color: #f00; font-weight: bold; }
+    .fast { color: #0f0; }
+    .slow { color: #f44; }
+    .tie  { color: #888; }
+    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer;
+               background: #00d4ff; color: #000; border: none;
+               border-radius: 4px; font-family: monospace; font-weight: bold; }
+    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #sysinfo { color: #888; margin: 1em 0; font-size: 0.9em; }
+    #log { margin: 1em 0; padding: 1em; background: #111;
+           border-radius: 6px; max-height: 300px; overflow-y: auto;
+           font-size: 0.85em; }
+    .log-line { margin: 2px 0; }
+    p.note { color: #aaa; font-size: 0.9em; margin-top: -0.5em; }
+  </style>
+</head>
+<body>
+  <h1>BLAKE3 WASM Benchmark</h1>
+  <div id="sysinfo"></div>
+  <button id="run-btn">Run Benchmarks</button>
+
+  <h2>1. Memory Poke</h2>
+  <p class="note">Raw JS write of 64 KiB into each module's WASM linear memory (no hashing).</p>
+  <div id="poke-out"><p style="color:#888">Click "Run Benchmarks".</p></div>
+
+  <h2>2. Single Parcel CV — apples-to-apples</h2>
+  <p class="note">One 64 KiB parcel per JS→Wasm call, both sides.
+     Identical function shape; isolates hashing core.</p>
+  <div id="single-out"><p style="color:#888">Click "Run Benchmarks".</p></div>
+
+  <h2>3. Batch Parcel CVs</h2>
+  <p class="note">Your one Rust call (hash_64k_parcels_to_cvs) vs
+     lamb356 JS loop (one hash_subtree_ptr_into per parcel).
+     Includes JS↔Wasm call-structure difference.</p>
+  <div id="batch-out"><p style="color:#888">Click "Run Benchmarks".</p></div>
+
+  <h2>Log</h2>
+  <div id="log"></div>
+
+<script type="module">
+// ═══════════════════════════════════════════════════════════
+//  Configuration
+// ═══════════════════════════════════════════════════════════
+const MY_PKG_PATH  = '../pkg/blake3_wasm_streaming.js';
+ const HIS_PKG_PATH = '../../lamb356-blake3-wasm/blake3-wasm-shared/pkg/blake3_wasm_shared.js';
+
+ const PARCEL = 64 * 1024;
+const CV     = 32;
+
+// ═══════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════
+const logEl = document.getElementById('log');
+function log(s) {
+  const d = document.createElement('div');
+  d.className = 'log-line';
+  d.textContent = `[${performance.now().toFixed(1)}] ${s}`;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(s);
+}
+function hex(b) {
+  return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+}
+function eq(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function fill(heap, ptr, n) {
+  for (let i = 0; i < n; i++) heap[ptr + i] = i & 0xff;
+}
+function sorted(arr) { return arr.slice().sort((a, b) => a - b); }
+function medianOf(arr) { const s = sorted(arr); return s[Math.floor(s.length / 2)]; }
+function meanOf(arr) { return arr.reduce((a, b) => a + b, 0) / arr.length; }
+function diffHtml(mine, his) {
+  const p = (mine - his) / his * 100;
+  const c = p < -1 ? 'fast' : p > 1 ? 'slow' : 'tie';
+  return `<span class="${c}">${p >= 0 ? '+' : ''}${p.toFixed(1)}%</span>`;
+}
+function statusHtml(ok) {
+  return ok ? '<span class="ok">MATCH</span>' : '<span class="err">MISMATCH</span>';
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ═══════════════════════════════════════════════════════════
+//  Sysinfo
+// ═══════════════════════════════════════════════════════════
+document.getElementById('sysinfo').innerHTML =
+  `Platform: ${navigator.platform} &ensp;|&ensp; ` +
+  `Cores: ${navigator.hardwareConcurrency} &ensp;|&ensp; ` +
+  `UA: ${navigator.userAgent.slice(0, 120)}`;
+
+// ═══════════════════════════════════════════════════════════
+//  Module loading
+// ═══════════════════════════════════════════════════════════
+let myPkg, myWasm, hisPkg, hisWasm;
+
+async function loadModules() {
+  log('Loading your module…');
+  myPkg  = await import(MY_PKG_PATH);
+  myWasm = await myPkg.default();
+  log(`  Loaded. Memory ${myWasm.memory.buffer.byteLength} bytes.`);
+
+  log('Loading lamb356 module…');
+  hisPkg  = await import(HIS_PKG_PATH);
+  hisWasm = await hisPkg.default();
+  log(`  Loaded. Memory ${hisWasm.memory.buffer.byteLength} bytes.`);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  1. Poke benchmark — both modules
+// ═══════════════════════════════════════════════════════════
+function benchPoke(allocFn, freeFn, memory, iters) {
+  const ptr = allocFn(PARCEL);
+  const src = new Uint8Array(PARCEL);
+  for (let i = 0; i < PARCEL; i++) src[i] = i & 0xff;
+
+  for (let i = 0; i < 200; i++)
+    new Uint8Array(memory.buffer, ptr, PARCEL).set(src);
+
+  const times = [];
+  for (let i = 0; i < iters; i++) {
+    const t0 = performance.now();
+    new Uint8Array(memory.buffer, ptr, PARCEL).set(src);
+    times.push(performance.now() - t0);
+  }
+  freeFn(ptr, PARCEL);
+  return { median: medianOf(times), mean: meanOf(times) };
+}
+
+// ═══════════════════════════════════════════════════════════
+//  2. Single-parcel benchmark
+// ═══════════════════════════════════════════════════════════
+function benchSingleParcel(allocFn, freeFn, hashFn, memory, offset, iters, warmup) {
+  const inPtr  = allocFn(PARCEL);
+  const outPtr = allocFn(CV);
+  fill(new Uint8Array(memory.buffer), inPtr, PARCEL);
+
+  for (let i = 0; i < warmup; i++)
+    hashFn(inPtr, PARCEL, offset, outPtr);
+
+  const times = [];
+  for (let i = 0; i < iters; i++) {
+    const t0 = performance.now();
+    hashFn(inPtr, PARCEL, offset, outPtr);
+    times.push(performance.now() - t0);
+  }
+
+  const cv = new Uint8Array(memory.buffer, outPtr, CV).slice();
+  freeFn(outPtr, CV);
+  freeFn(inPtr, PARCEL);
+  return { median: medianOf(times), mean: meanOf(times), cv };
+}
+
+// ═══════════════════════════════════════════════════════════
+//  3. Batch-parcel benchmark
+// ═══════════════════════════════════════════════════════════
+function benchBatch(totalBytes, iters, warmup) {
+  const numParcels = totalBytes / PARCEL;
+  const cvBuf      = numParcels * CV;
+
+  const mIn  = myPkg.alloc(totalBytes);
+  const mOut = myPkg.alloc(cvBuf);
+  fill(new Uint8Array(myWasm.memory.buffer), mIn, totalBytes);
+
+  for (let i = 0; i < warmup; i++)
+    myPkg.hash_64k_parcels_to_cvs_from_ptr(mIn, totalBytes, 0n, mOut, cvBuf);
+
+  const mTimes = [];
+  for (let i = 0; i < iters; i++) {
+    const t0 = performance.now();
+    myPkg.hash_64k_parcels_to_cvs_from_ptr(mIn, totalBytes, 0n, mOut, cvBuf);
+    mTimes.push(performance.now() - t0);
+  }
+  const mCvs = new Uint8Array(myWasm.memory.buffer, mOut, cvBuf).slice();
+  myPkg.dealloc(mOut, cvBuf);
+  myPkg.dealloc(mIn, totalBytes);
+
+  const hIn  = hisPkg.alloc_input(totalBytes);
+  const hOut = hisPkg.alloc_input(cvBuf);
+  fill(new Uint8Array(hisWasm.memory.buffer), hIn, totalBytes);
+
+  for (let w = 0; w < warmup; w++)
+    for (let p = 0; p < numParcels; p++)
+      hisPkg.hash_subtree_ptr_into(
+        hIn + p * PARCEL, PARCEL,
+        BigInt(p * PARCEL),
+        hOut + p * CV);
+
+  const hTimes = [];
+  for (let i = 0; i < iters; i++) {
+    const t0 = performance.now();
+    for (let p = 0; p < numParcels; p++)
+      hisPkg.hash_subtree_ptr_into(
+        hIn + p * PARCEL, PARCEL,
+        BigInt(p * PARCEL),
+        hOut + p * CV);
+    hTimes.push(performance.now() - t0);
+  }
+  const hCvs = new Uint8Array(hisWasm.memory.buffer, hOut, cvBuf).slice();
+  hisPkg.free_input(hOut, cvBuf);
+  hisPkg.free_input(hIn, totalBytes);
+
+  return {
+    myMean: meanOf(mTimes), myMedian: medianOf(mTimes),
+    hisMean: meanOf(hTimes), hisMedian: medianOf(hTimes),
+    match: eq(mCvs, hCvs), numParcels,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Main
+// ═══════════════════════════════════════════════════════════
+async function run() {
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+  logEl.innerHTML = '';
+
+  try {
+    await loadModules();
+    await sleep(50);
+
+    // ── 1. Poke ──────────────────────────────────────────
+    const POKE_ITERS = 10000;
+    log(`Poke benchmark (${POKE_ITERS} iters, both modules)…`);
+
+    const myPoke = benchPoke(
+      n => myPkg.alloc(n),
+      (p, n) => myPkg.dealloc(p, n),
+      myWasm.memory, POKE_ITERS);
+
+    const hisPoke = benchPoke(
+      n => hisPkg.alloc_input(n),
+      (p, n) => hisPkg.free_input(p, n),
+      hisWasm.memory, POKE_ITERS);
+
+    log(`  yours  mean ${myPoke.mean.toFixed(4)} ms  median ${myPoke.median.toFixed(4)} ms`);
+    log(`  lamb356 mean ${hisPoke.mean.toFixed(4)} ms  median ${hisPoke.median.toFixed(4)} ms`);
+
+    document.getElementById('poke-out').innerHTML = `<table>
+      <tr><th>Module</th><th>Size</th><th>Iters</th>
+          <th>Mean (ms)</th><th>Median (ms)</th><th>Diff</th></tr>
+      <tr><td>Yours</td><td>64 KiB</td><td>${POKE_ITERS.toLocaleString()}</td>
+          <td>${myPoke.mean.toFixed(4)}</td>
+          <td>${myPoke.median.toFixed(4)}</td>
+          <td>${diffHtml(myPoke.mean, hisPoke.mean)}</td></tr>
+      <tr><td>lamb356</td><td>64 KiB</td><td>${POKE_ITERS.toLocaleString()}</td>
+          <td>${hisPoke.mean.toFixed(4)}</td>
+          <td>${hisPoke.median.toFixed(4)}</td>
+          <td>baseline</td></tr></table>`;
+    await sleep(50);
+
+    // ── 2. Single parcel ─────────────────────────────────
+    const S_ITERS = 10000, S_WARM = 500;
+    const offsets = [
+      { label: '0 bytes',      value: 0n },
+      { label: '65,536 bytes', value: 65536n },
+    ];
+
+    let sHtml = `<table>
+      <tr><th>Size</th><th>Offset</th><th>Iters</th>
+          <th>Yours (mean ms)</th><th>lamb356 (mean ms)</th>
+          <th>Diff</th><th>Status</th></tr>`;
+
+    for (const { label, value } of offsets) {
+      log(`Single parcel @ ${label}…`);
+
+      const mine = benchSingleParcel(
+        n => myPkg.alloc(n),
+        (p, n) => myPkg.dealloc(p, n),
+        (ip, il, off, op) => myPkg.hash_64k_parcel_to_cv_from_ptr(ip, il, off, op),
+        myWasm.memory, value, S_ITERS, S_WARM);
+      await sleep(10);
+
+      const his = benchSingleParcel(
+        n => hisPkg.alloc_input(n),
+        (p, n) => hisPkg.free_input(p, n),
+        (ip, il, off, op) => hisPkg.hash_subtree_ptr_into(ip, il, off, op),
+        hisWasm.memory, value, S_ITERS, S_WARM);
+
+      const ok = eq(mine.cv, his.cv);
+      log(`  yours ${mine.mean.toFixed(4)} ms | lamb356 ${his.mean.toFixed(4)} ms | ${ok ? 'MATCH' : 'MISMATCH'}`);
+
+      sHtml += `<tr>
+        <td>64 KiB</td><td>${label}</td>
+        <td>${S_ITERS.toLocaleString()}</td>
+        <td>${mine.mean.toFixed(4)}</td><td>${his.mean.toFixed(4)}</td>
+        <td>${diffHtml(mine.mean, his.mean)}</td>
+        <td>${statusHtml(ok)}</td></tr>`;
+      await sleep(10);
+    }
+    sHtml += '</table>';
+    document.getElementById('single-out').innerHTML = sHtml;
+    await sleep(50);
+
+    // ── 3. Batch parcels ─────────────────────────────────
+    const batchCases = [
+      { label: '64 KiB',  bytes: 64 * 1024,       iters: 10000, warmup: 500 },
+      { label: '1 MiB',   bytes: 1024 * 1024,      iters: 1000,  warmup: 50  },
+      { label: '16 MiB',  bytes: 16 * 1024 * 1024, iters: 50,    warmup: 5   },
+    ];
+
+    let bHtml = `<table>
+      <tr><th>Total</th><th>Parcels</th><th>Iters</th>
+          <th>Yours batch (mean ms)</th><th>lamb356 loop (mean ms)</th>
+          <th>Diff</th><th>Status</th></tr>`;
+
+    for (const { label, bytes, iters, warmup } of batchCases) {
+      log(`Batch ${label} (${iters} iters)…`);
+      await sleep(10);
+
+      const r = benchBatch(bytes, iters, warmup);
+      log(`  yours ${r.myMean.toFixed(3)} ms | lamb356 ${r.hisMean.toFixed(3)} ms | ${r.match ? 'MATCH' : 'MISMATCH'}`);
+
+      bHtml += `<tr>
+        <td>${label}</td><td>${r.numParcels}</td>
+        <td>${iters.toLocaleString()}</td>
+        <td>${r.myMean.toFixed(4)}</td><td>${r.hisMean.toFixed(4)}</td>
+        <td>${diffHtml(r.myMean, r.hisMean)}</td>
+        <td>${statusHtml(r.match)}</td></tr>`;
+      await sleep(50);
+    }
+    bHtml += '</table>';
+    document.getElementById('batch-out').innerHTML = bHtml;
+
+    log('Done!');
+  } catch (e) {
+    log(`ERROR: ${e.message || e}`);
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('run-btn').addEventListener('click', run);
+</script>
+</body>
 </html>
