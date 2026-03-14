@@ -1,354 +1,244 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>BLAKE3 WASM Benchmark</title>
-  <style>
-    body { font-family: monospace; max-width: 1200px; margin: 2em auto;
-           background: #1a1a2e; color: #e0e0e0; padding: 0 1em; }
-    h1, h2 { color: #00d4ff; }
-    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-    th { background: #222; color: #00d4ff; text-align: left;
-         padding: 8px 12px; border: 1px solid #333; }
-    td { padding: 8px 12px; border: 1px solid #333; }
-    tr:nth-child(even) { background: #1e1e3a; }
-    .ok   { color: #0f0; font-weight: bold; }
-    .err  { color: #f00; font-weight: bold; }
-    .fast { color: #0f0; }
-    .slow { color: #f44; }
-    .tie  { color: #888; }
-    #run-btn { font-size: 1.2em; padding: 0.5em 2em; cursor: pointer;
-               background: #00d4ff; color: #000; border: none;
-               border-radius: 4px; font-family: monospace; font-weight: bold; }
-    #run-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-    #sysinfo { color: #888; margin: 1em 0; font-size: 0.9em; }
-    #log { margin: 1em 0; padding: 1em; background: #111;
-           border-radius: 6px; max-height: 300px; overflow-y: auto;
-           font-size: 0.85em; }
-    .log-line { margin: 2px 0; }
-    p.note { color: #aaa; font-size: 0.9em; margin-top: -0.5em; }
-  </style>
-</head>
-<body>
-  <h1>BLAKE3 WASM Benchmark</h1>
-  <div id="sysinfo"></div>
-  <button id="run-btn">Run Benchmarks</button>
+  <head>
+    <meta charset="UTF-8" />
+    <title>BLAKE3 WASM – bench</title>
+    <style>
+     body { background:#1e1e1e; color:#d4d4d4; font-family:monospace; margin:2em; }
+     h1 { color:#569cd6; }
+     table { border-collapse:collapse; margin:1em 0; }
+     th,td { border:1px solid #444; padding:4px 10px; text-align:right; }
+     th { background:#264f78; }
+     .pass { color:#6a9955; } .fail { color:#f44747; }
+     #log { white-space:pre-wrap; font-size:0.85em; margin-top:1em;
+       background:#181818; padding:1em; max-height:50vh; overflow-y:auto; }
+     button { font-size:1.1em; padding:0.4em 1.2em; margin:0.5em 0; }
+    </style>
+  </head>
+  <body>
+    <h1>BLAKE3 WASM Benchmark</h1>
+    <p id="info"></p>
+    <button id="run" onclick="runAll()">Run Benchmarks</button>
+    <div id="results"></div>
+    <div id="log"></div>
 
-  <h2>1. Memory Poke</h2>
-  <p class="note">Raw JS write of 64 KiB into each module's WASM linear memory (no hashing).</p>
-  <div id="poke-out"><p style="color:#888">Click "Run Benchmarks".</p></div>
+    <script type="module">
 
-  <h2>2. Single Parcel CV — apples-to-apples</h2>
-  <p class="note">One 64 KiB parcel per JS→Wasm call, both sides.
-     Identical function shape; isolates hashing core.</p>
-  <div id="single-out"><p style="color:#888">Click "Run Benchmarks".</p></div>
+     const MY_PKG_PATH  = '../pkg/blake3_wasm_streaming.js';
+     const HIS_PKG_PATH = '../../lamb356-blake3-wasm/blake3-wasm-shared/pkg/blake3_wasm_shared.js';
 
-  <h2>3. Batch Parcel CVs</h2>
-  <p class="note">Your one Rust call (hash_64k_parcels_to_cvs) vs
-     lamb356 JS loop (one hash_subtree_ptr_into per parcel).
-     Includes JS↔Wasm call-structure difference.</p>
-  <div id="batch-out"><p style="color:#888">Click "Run Benchmarks".</p></div>
+     const PARCEL_LEN    = 65536;          // 64 KiB
+     const CV_LEN        = 32;
+     const MEASUREMENTS  = 10;
 
-  <h2>Log</h2>
-  <div id="log"></div>
+     const $log     = document.getElementById('log');
+     const $results = document.getElementById('results');
+     const $info    = document.getElementById('info');
+     const $btn     = document.getElementById('run');
 
-<script type="module">
-// ═══════════════════════════════════════════════════════════
-//  Configuration
-// ═══════════════════════════════════════════════════════════
-const MY_PKG_PATH  = '../pkg/blake3_wasm_streaming.js';
- const HIS_PKG_PATH = '../../lamb356-blake3-wasm/blake3-wasm-shared/pkg/blake3_wasm_shared.js';
+     function log(msg) { $log.textContent += msg + '\n'; }
+     function clearLog() { $log.textContent = ''; $results.innerHTML = ''; }
 
- const PARCEL = 64 * 1024;
-const CV     = 32;
+     $info.textContent = `${navigator.userAgent}  | hardwareConcurrency=${navigator.hardwareConcurrency}`;
 
-// ═══════════════════════════════════════════════════════════
-//  Helpers
-// ═══════════════════════════════════════════════════════════
-const logEl = document.getElementById('log');
-function log(s) {
-  const d = document.createElement('div');
-  d.className = 'log-line';
-  d.textContent = `[${performance.now().toFixed(1)}] ${s}`;
-  logEl.appendChild(d);
-  logEl.scrollTop = logEl.scrollHeight;
-  console.log(s);
-}
-function hex(b) {
-  return [...b].map(x => x.toString(16).padStart(2, '0')).join('');
-}
-function eq(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-function fill(heap, ptr, n) {
-  for (let i = 0; i < n; i++) heap[ptr + i] = i & 0xff;
-}
-function sorted(arr) { return arr.slice().sort((a, b) => a - b); }
-function medianOf(arr) { const s = sorted(arr); return s[Math.floor(s.length / 2)]; }
-function meanOf(arr) { return arr.reduce((a, b) => a + b, 0) / arr.length; }
-function diffHtml(mine, his) {
-  const p = (mine - his) / his * 100;
-  const c = p < -1 ? 'fast' : p > 1 ? 'slow' : 'tie';
-  return `<span class="${c}">${p >= 0 ? '+' : ''}${p.toFixed(1)}%</span>`;
-}
-function statusHtml(ok) {
-  return ok ? '<span class="ok">MATCH</span>' : '<span class="err">MISMATCH</span>';
-}
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+     function wrapMy(pkg, wasm) {
+       return {
+         alloc:   (n) => pkg.alloc(n),
+         dealloc: (ptr, n) => pkg.dealloc(ptr, n),
+         memory:  wasm.memory,
+         hashParcel(inPtr, len, offset, outPtr) {
+           pkg.hash_64k_parcel_to_cv_from_ptr(inPtr, len, offset, outPtr);
+         },
+       };
+     }
 
-// ═══════════════════════════════════════════════════════════
-//  Sysinfo
-// ═══════════════════════════════════════════════════════════
-document.getElementById('sysinfo').innerHTML =
-  `Platform: ${navigator.platform} &ensp;|&ensp; ` +
-  `Cores: ${navigator.hardwareConcurrency} &ensp;|&ensp; ` +
-  `UA: ${navigator.userAgent.slice(0, 120)}`;
+     function wrapHis(pkg, wasm) {
+       return {
+         alloc:   (n) => pkg.alloc_input(n),
+         dealloc: (ptr, n) => pkg.free_input(ptr, n),
+         memory:  wasm.memory,
+         hashParcel(inPtr, len, offset, outPtr) {
+           pkg.hash_subtree_ptr_into(inPtr, len, offset, outPtr);
+         },
+       };
+     }
 
-// ═══════════════════════════════════════════════════════════
-//  Module loading
-// ═══════════════════════════════════════════════════════════
-let myPkg, myWasm, hisPkg, hisWasm;
+     let my, his;
 
-async function loadModules() {
-  log('Loading your module…');
-  myPkg  = await import(MY_PKG_PATH);
-  myWasm = await myPkg.default();
-  log(`  Loaded. Memory ${myWasm.memory.buffer.byteLength} bytes.`);
+     async function loadModules() {
+       if (my && his) return;
+       const [myMod, hisMod] = await Promise.all([
+         import(MY_PKG_PATH),
+         import(HIS_PKG_PATH),
+       ]);
+       const myWasm  = await myMod.default();
+       const hisWasm = await hisMod.default();
+       my  = wrapMy(myMod, myWasm);
+       his = wrapHis(hisMod, hisWasm);
+       log(`my  memory: ${my.memory.buffer.byteLength} bytes`);
+       log(`his memory: ${his.memory.buffer.byteLength} bytes`);
+     }
 
-  log('Loading lamb356 module…');
-  hisPkg  = await import(HIS_PKG_PATH);
-  hisWasm = await hisPkg.default();
-  log(`  Loaded. Memory ${hisWasm.memory.buffer.byteLength} bytes.`);
-}
+     function fillDeterministic(heap, ptr, len) {
+       for (let i = 0; i < len; i++) heap[ptr + i] = i & 0xff;
+     }
 
-// ═══════════════════════════════════════════════════════════
-//  1. Poke benchmark — both modules
-// ═══════════════════════════════════════════════════════════
-function benchPoke(allocFn, freeFn, memory, iters) {
-  const ptr = allocFn(PARCEL);
-  const src = new Uint8Array(PARCEL);
-  for (let i = 0; i < PARCEL; i++) src[i] = i & 0xff;
+     function hex(u8, n = u8.length) {
+       let s = '';
+       for (let i = 0; i < n; i++) s += u8[i].toString(16).padStart(2, '0');
+       return s;
+     }
 
-  for (let i = 0; i < 200; i++)
-    new Uint8Array(memory.buffer, ptr, PARCEL).set(src);
+     function median(arr) {
+       const s = [...arr].sort((a, b) => a - b);
+       return s[s.length >> 1];
+     }
 
-  const times = [];
-  for (let i = 0; i < iters; i++) {
-    const t0 = performance.now();
-    new Uint8Array(memory.buffer, ptr, PARCEL).set(src);
-    times.push(performance.now() - t0);
-  }
-  freeFn(ptr, PARCEL);
-  return { median: medianOf(times), mean: meanOf(times) };
-}
+     function sum(arr) {
+       return arr.reduce((a, b) => a + b, 0);
+     }
 
-// ═══════════════════════════════════════════════════════════
-//  2. Single-parcel benchmark
-// ═══════════════════════════════════════════════════════════
-function benchSingleParcel(allocFn, freeFn, hashFn, memory, offset, iters, warmup) {
-  const inPtr  = allocFn(PARCEL);
-  const outPtr = allocFn(CV);
-  fill(new Uint8Array(memory.buffer), inPtr, PARCEL);
+     // Returns array of raw elapsed ms, each entry covering `iters` iterations.
+     function benchPokeOnly(w, numParcels, iters) {
+       const totalBytes = numParcels * PARCEL_LEN;
+       const ptr = w.alloc(totalBytes);
+       const heap = new Uint8Array(w.memory.buffer);
 
-  for (let i = 0; i < warmup; i++)
-    hashFn(inPtr, PARCEL, offset, outPtr);
+       const times = [];
+       for (let j = 0; j < MEASUREMENTS; j++) {
+         const t0 = performance.now();
+         for (let i = 0; i < iters; i++) {
+           fillDeterministic(heap, ptr, totalBytes);
+         }
+         times.push(performance.now() - t0);
+       }
 
-  const times = [];
-  for (let i = 0; i < iters; i++) {
-    const t0 = performance.now();
-    hashFn(inPtr, PARCEL, offset, outPtr);
-    times.push(performance.now() - t0);
-  }
+       w.dealloc(ptr, totalBytes);
+       return times;
+     }
 
-  const cv = new Uint8Array(memory.buffer, outPtr, CV).slice();
-  freeFn(outPtr, CV);
-  freeFn(inPtr, PARCEL);
-  return { median: medianOf(times), mean: meanOf(times), cv };
-}
+     // Returns { times: raw elapsed ms[], lastCv }
+     function benchParcelCvs(w, numParcels, iters) {
+       const inPtr  = w.alloc(PARCEL_LEN);
+       const outPtr = w.alloc(CV_LEN);
+       const heap   = new Uint8Array(w.memory.buffer);
+       fillDeterministic(heap, inPtr, PARCEL_LEN);
 
-// ═══════════════════════════════════════════════════════════
-//  3. Batch-parcel benchmark
-// ═══════════════════════════════════════════════════════════
-function benchBatch(totalBytes, iters, warmup) {
-  const numParcels = totalBytes / PARCEL;
-  const cvBuf      = numParcels * CV;
+       const PARCEL_LEN_BIG = BigInt(PARCEL_LEN);
 
-  const mIn  = myPkg.alloc(totalBytes);
-  const mOut = myPkg.alloc(cvBuf);
-  fill(new Uint8Array(myWasm.memory.buffer), mIn, totalBytes);
+       const times = [];
+       for (let j = 0; j < MEASUREMENTS; j++) {
+         const t0 = performance.now();
+         for (let i = 0; i < iters; i++) {
+           let off = 0n;
+           for (let p = 0; p < numParcels; p++) {
+             w.hashParcel(inPtr, PARCEL_LEN, off, outPtr);
+             off += PARCEL_LEN_BIG;
+           }
+         }
+         times.push(performance.now() - t0);
+       }
 
-  for (let i = 0; i < warmup; i++)
-    myPkg.hash_64k_parcels_to_cvs_from_ptr(mIn, totalBytes, 0n, mOut, cvBuf);
+       const lastCv = new Uint8Array(w.memory.buffer, outPtr, CV_LEN).slice();
+       w.dealloc(outPtr, CV_LEN);
+       w.dealloc(inPtr, PARCEL_LEN);
+       return { times, lastCv };
+     }
 
-  const mTimes = [];
-  for (let i = 0; i < iters; i++) {
-    const t0 = performance.now();
-    myPkg.hash_64k_parcels_to_cvs_from_ptr(mIn, totalBytes, 0n, mOut, cvBuf);
-    mTimes.push(performance.now() - t0);
-  }
-  const mCvs = new Uint8Array(myWasm.memory.buffer, mOut, cvBuf).slice();
-  myPkg.dealloc(mOut, cvBuf);
-  myPkg.dealloc(mIn, totalBytes);
+     function correctnessCheck() {
+       function hashOne(w, offset) {
+         const inPtr  = w.alloc(PARCEL_LEN);
+         const outPtr = w.alloc(CV_LEN);
+         const heap   = new Uint8Array(w.memory.buffer);
+         fillDeterministic(heap, inPtr, PARCEL_LEN);
+         w.hashParcel(inPtr, PARCEL_LEN, offset, outPtr);
+         const cv = new Uint8Array(w.memory.buffer, outPtr, CV_LEN).slice();
+         w.dealloc(outPtr, CV_LEN);
+         w.dealloc(inPtr, PARCEL_LEN);
+         return cv;
+       }
 
-  const hIn  = hisPkg.alloc_input(totalBytes);
-  const hOut = hisPkg.alloc_input(cvBuf);
-  fill(new Uint8Array(hisWasm.memory.buffer), hIn, totalBytes);
+       const myCv0  = hashOne(my,  0n);
+       const hisCv0 = hashOne(his, 0n);
+       const match  = myCv0.every((v, i) => v === hisCv0[i]);
 
-  for (let w = 0; w < warmup; w++)
-    for (let p = 0; p < numParcels; p++)
-      hisPkg.hash_subtree_ptr_into(
-        hIn + p * PARCEL, PARCEL,
-        BigInt(p * PARCEL),
-        hOut + p * CV);
+       log(`\nCorrectness (parcel 0, offset 0):`);
+       log(`  mine: ${hex(myCv0)}`);
+       log(`  his:  ${hex(hisCv0)}`);
+       log(`  ${match ? '✅ MATCH' : '❌ MISMATCH'}`);
 
-  const hTimes = [];
-  for (let i = 0; i < iters; i++) {
-    const t0 = performance.now();
-    for (let p = 0; p < numParcels; p++)
-      hisPkg.hash_subtree_ptr_into(
-        hIn + p * PARCEL, PARCEL,
-        BigInt(p * PARCEL),
-        hOut + p * CV);
-    hTimes.push(performance.now() - t0);
-  }
-  const hCvs = new Uint8Array(hisWasm.memory.buffer, hOut, cvBuf).slice();
-  hisPkg.free_input(hOut, cvBuf);
-  hisPkg.free_input(hIn, totalBytes);
+       const myCv1 = hashOne(my, 65536n);
+       const offsetDiffers = !myCv0.every((v, i) => v === myCv1[i]);
+       log(`  offset 0 vs 65536: ${offsetDiffers ? '✅ different (good)' : '❌ same (bad — offset ignored?)'}`);
 
-  return {
-    myMean: meanOf(mTimes), myMedian: medianOf(mTimes),
-    hisMean: meanOf(hTimes), hisMedian: medianOf(hTimes),
-    match: eq(mCvs, hCvs), numParcels,
-  };
-}
+       return match;
+     }
 
-// ═══════════════════════════════════════════════════════════
-//  Main
-// ═══════════════════════════════════════════════════════════
-async function run() {
-  const btn = document.getElementById('run-btn');
-  btn.disabled = true;
-  logEl.innerHTML = '';
+     function renderTable(title, rows) {
+       let html = `<h3>${title}</h3><table>
+         <tr><th>Side</th><th>Parcels</th><th>Iters</th><th>Median ms/iter</th><th>Total ms</th></tr>`;
+       for (const r of rows) {
+         html += `<tr><td>${r.label}</td><td>${r.parcels}</td>
+           <td>${r.iters}</td>
+           <td>${(r.medianMs / r.iters).toFixed(3)}</td>
+           <td>${r.sumMs.toFixed(1)}</td></tr>`;
+       }
+       html += '</table>';
+       return html;
+     }
 
-  try {
-    await loadModules();
-    await sleep(50);
+     async function runAll() {
+       $btn.disabled = true;
+       clearLog();
+       log('Loading modules…');
 
-    // ── 1. Poke ──────────────────────────────────────────
-    const POKE_ITERS = 10000;
-    log(`Poke benchmark (${POKE_ITERS} iters, both modules)…`);
+       try {
+         await loadModules();
+         correctnessCheck();
 
-    const myPoke = benchPoke(
-      n => myPkg.alloc(n),
-      (p, n) => myPkg.dealloc(p, n),
-      myWasm.memory, POKE_ITERS);
+         let html = '';
 
-    const hisPoke = benchPoke(
-      n => hisPkg.alloc_input(n),
-      (p, n) => hisPkg.free_input(p, n),
-      hisWasm.memory, POKE_ITERS);
+         // ── poke_only ─────────────────────────────────────────────
+         {
+           const parcels = 64;
+           const iters = 10;
+           log(`\npoke_only: ${parcels} parcels, ${iters} iters…`);
+           const myTimes  = benchPokeOnly(my,  parcels, iters);
+           const hisTimes = benchPokeOnly(his, parcels, iters);
 
-    log(`  yours  mean ${myPoke.mean.toFixed(4)} ms  median ${myPoke.median.toFixed(4)} ms`);
-    log(`  lamb356 mean ${hisPoke.mean.toFixed(4)} ms  median ${hisPoke.median.toFixed(4)} ms`);
+           html += renderTable('poke_only (JS writes into WASM memory)', [
+             { label: 'mine', parcels, iters, medianMs: median(myTimes), sumMs: sum(myTimes) },
+             { label: 'his',  parcels, iters, medianMs: median(hisTimes), sumMs: sum(hisTimes) },
+           ]);
+         }
 
-    document.getElementById('poke-out').innerHTML = `<table>
-      <tr><th>Module</th><th>Size</th><th>Iters</th>
-          <th>Mean (ms)</th><th>Median (ms)</th><th>Diff</th></tr>
-      <tr><td>Yours</td><td>64 KiB</td><td>${POKE_ITERS.toLocaleString()}</td>
-          <td>${myPoke.mean.toFixed(4)}</td>
-          <td>${myPoke.median.toFixed(4)}</td>
-          <td>${diffHtml(myPoke.mean, hisPoke.mean)}</td></tr>
-      <tr><td>lamb356</td><td>64 KiB</td><td>${POKE_ITERS.toLocaleString()}</td>
-          <td>${hisPoke.mean.toFixed(4)}</td>
-          <td>${hisPoke.median.toFixed(4)}</td>
-          <td>baseline</td></tr></table>`;
-    await sleep(50);
+         // ── parcel CVs ────────────────────────────────────────────
+         for (const parcels of [16, 64, 256]) {
+           const iters = Math.max(1, Math.floor(1000 / parcels));
+           log(`\nparcel_cvs: ${parcels} parcels, ${iters} iters…`);
 
-    // ── 2. Single parcel ─────────────────────────────────
-    const S_ITERS = 10000, S_WARM = 500;
-    const offsets = [
-      { label: '0 bytes',      value: 0n },
-      { label: '65,536 bytes', value: 65536n },
-    ];
+           const myR  = benchParcelCvs(my,  parcels, iters);
+           const hisR = benchParcelCvs(his, parcels, iters);
 
-    let sHtml = `<table>
-      <tr><th>Size</th><th>Offset</th><th>Iters</th>
-          <th>Yours (mean ms)</th><th>lamb356 (mean ms)</th>
-          <th>Diff</th><th>Status</th></tr>`;
+           log(`  mine  median ${(median(myR.times) / iters).toFixed(3)} ms/iter  last_cv=${hex(myR.lastCv, 8)}…`);
+           log(`  his   median ${(median(hisR.times) / iters).toFixed(3)} ms/iter  last_cv=${hex(hisR.lastCv, 8)}…`);
 
-    for (const { label, value } of offsets) {
-      log(`Single parcel @ ${label}…`);
+           html += renderTable(`parcel_cvs — ${parcels} × 64 KiB parcels`, [
+             { label: 'mine', parcels, iters, medianMs: median(myR.times), sumMs: sum(myR.times) },
+             { label: 'his',  parcels, iters, medianMs: median(hisR.times), sumMs: sum(hisR.times) },
+           ]);
+         }
 
-      const mine = benchSingleParcel(
-        n => myPkg.alloc(n),
-        (p, n) => myPkg.dealloc(p, n),
-        (ip, il, off, op) => myPkg.hash_64k_parcel_to_cv_from_ptr(ip, il, off, op),
-        myWasm.memory, value, S_ITERS, S_WARM);
-      await sleep(10);
+         $results.innerHTML = html;
+         log('\nDone.');
+       } catch (e) {
+         log(`ERROR: ${e}\n${e.stack || ''}`);
+       } finally {
+         $btn.disabled = false;
+       }
+     }
 
-      const his = benchSingleParcel(
-        n => hisPkg.alloc_input(n),
-        (p, n) => hisPkg.free_input(p, n),
-        (ip, il, off, op) => hisPkg.hash_subtree_ptr_into(ip, il, off, op),
-        hisWasm.memory, value, S_ITERS, S_WARM);
-
-      const ok = eq(mine.cv, his.cv);
-      log(`  yours ${mine.mean.toFixed(4)} ms | lamb356 ${his.mean.toFixed(4)} ms | ${ok ? 'MATCH' : 'MISMATCH'}`);
-
-      sHtml += `<tr>
-        <td>64 KiB</td><td>${label}</td>
-        <td>${S_ITERS.toLocaleString()}</td>
-        <td>${mine.mean.toFixed(4)}</td><td>${his.mean.toFixed(4)}</td>
-        <td>${diffHtml(mine.mean, his.mean)}</td>
-        <td>${statusHtml(ok)}</td></tr>`;
-      await sleep(10);
-    }
-    sHtml += '</table>';
-    document.getElementById('single-out').innerHTML = sHtml;
-    await sleep(50);
-
-    // ── 3. Batch parcels ─────────────────────────────────
-    const batchCases = [
-      { label: '64 KiB',  bytes: 64 * 1024,       iters: 10000, warmup: 500 },
-      { label: '1 MiB',   bytes: 1024 * 1024,      iters: 1000,  warmup: 50  },
-      { label: '16 MiB',  bytes: 16 * 1024 * 1024, iters: 50,    warmup: 5   },
-    ];
-
-    let bHtml = `<table>
-      <tr><th>Total</th><th>Parcels</th><th>Iters</th>
-          <th>Yours batch (mean ms)</th><th>lamb356 loop (mean ms)</th>
-          <th>Diff</th><th>Status</th></tr>`;
-
-    for (const { label, bytes, iters, warmup } of batchCases) {
-      log(`Batch ${label} (${iters} iters)…`);
-      await sleep(10);
-
-      const r = benchBatch(bytes, iters, warmup);
-      log(`  yours ${r.myMean.toFixed(3)} ms | lamb356 ${r.hisMean.toFixed(3)} ms | ${r.match ? 'MATCH' : 'MISMATCH'}`);
-
-      bHtml += `<tr>
-        <td>${label}</td><td>${r.numParcels}</td>
-        <td>${iters.toLocaleString()}</td>
-        <td>${r.myMean.toFixed(4)}</td><td>${r.hisMean.toFixed(4)}</td>
-        <td>${diffHtml(r.myMean, r.hisMean)}</td>
-        <td>${statusHtml(r.match)}</td></tr>`;
-      await sleep(50);
-    }
-    bHtml += '</table>';
-    document.getElementById('batch-out').innerHTML = bHtml;
-
-    log('Done!');
-  } catch (e) {
-    log(`ERROR: ${e.message || e}`);
-    console.error(e);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-document.getElementById('run-btn').addEventListener('click', run);
-</script>
-</body>
+     window.runAll = runAll;
+    </script>
+  </body>
 </html>
