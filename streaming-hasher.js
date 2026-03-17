@@ -16,8 +16,8 @@ export class StreamingHasher {
     async init(wasmPath = './pkg/blake3_wasm_streaming_bg.wasm') {
         // 1. Shared memory for main thread + all workers
         this.memory = new WebAssembly.Memory({
-            initial: 18,
-            maximum: 1024,   // 64 MiB — must match wasm module's declared max
+            initial: 4096,
+            maximum: 16384,   // matches --max-memory from .cargo/config.toml
             shared: true,
         });
 
