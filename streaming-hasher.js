@@ -1,24 +1,6 @@
 const CV_LEN = 32;
 const WORKER_STACK = 65536;
 
-function buildImports(wasmModule, memory) {
-    const modImports = WebAssembly.Module.imports(wasmModule);
-    const imports = {};
-    for (const imp of modImports) {
-        if (!imports[imp.module]) imports[imp.module] = {};
-        if (imp.kind === 'memory') {
-            imports[imp.module][imp.name] = memory;
-        } else if (imp.kind === 'function') {
-            imports[imp.module][imp.name] = () => {};
-        } else if (imp.kind === 'table') {
-            imports[imp.module][imp.name] = new WebAssembly.Table({ initial: 128, element: 'anyfunc' });
-        } else if (imp.kind === 'global') {
-            imports[imp.module][imp.name] = new WebAssembly.Global({ value: 'i32', mutable: true }, 0);
-        }
-    }
-    return imports;
-}
-
 export class StreamingHasher {
     constructor(wasmModule, memory, workerCount, { dataPtr, cvPtr, parcelSize, maxParcels }) {
         this.workers = [];
@@ -37,8 +19,10 @@ export class StreamingHasher {
     }
 
     async init() {
-        const imports = buildImports(this.wasmModule, this.memory);
-        const instance = await WebAssembly.instantiate(this.wasmModule, imports);
+        const instance = await WebAssembly.instantiate(this.wasmModule, {
+            env: { memory: this.memory },
+        });
+
         this.wasm = instance.exports;
         await this.spawnWorkers(this.workerCount);
     }
