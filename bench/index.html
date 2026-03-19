@@ -1,322 +1,349 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8">
     <title>BLAKE3 WASM — Zero-Allocation Benchmarks</title>
     <style>
-     body { background:#1a1a2e; color:#e0e0e0; font-family:monospace; padding:20px; max-width:1500px; margin:auto; }
-     h1 { color:#00ff88; }
-     h2 { color:#88ccff; margin-top:2em; }
-     button { background:#00ff88; color:#1a1a2e; border:none; padding:10px 24px;
-       font-size:16px; cursor:pointer; font-family:monospace; font-weight:bold; border-radius:4px; }
-     button:disabled { opacity:0.4; cursor:not-allowed; }
-     table { border-collapse:collapse; margin:1em 0; }
-     th, td { border:1px solid #444; padding:5px 10px; text-align:right; font-size:13px; }
-     th { background:#2a2a4e; color:#88ccff; }
-     td.lbl { text-align:left; color:#ccc; white-space:nowrap; }
-     .good { color:#00ff88; }
-     .ok   { color:#ccff00; }
-     .meh  { color:#ffcc00; }
-     .bad  { color:#ff4444; }
-     .speedup { font-weight:bold; font-size:12px; }
-     #log { background:#0a0a1e; padding:10px; border:1px solid #333;
-       max-height:300px; overflow-y:auto; font-size:11px; white-space:pre-wrap; margin-top:1em; }
-     #progress { color:#ffcc00; font-size:14px; min-height:1.5em; margin:8px 0; }
-     .note { color:#888; font-size:12px; }
+     body {
+       font-family: 'Courier New', monospace;
+       background: #1a1a2e; color: #e0e0e0;
+       padding: 20px; max-width: 1400px; margin: 0 auto;
+     }
+     h1 { color: #0ff; }
+     h2 { color: #0ff; margin-top: 30px; }
+     table { border-collapse: collapse; margin: 10px 0; }
+     th, td { border: 1px solid #444; padding: 4px 12px; text-align: right; font-family: monospace; }
+     th { background: #2a2a4e; color: #0ff; }
+     td:first-child, th:first-child { text-align: left; }
+     button { font-size: 16px; padding: 8px 20px; margin: 5px 5px 5px 0; cursor: pointer; }
+     button:disabled { opacity: 0.4; cursor: default; }
+     #log {
+       white-space: pre-wrap; font-size: 12px; color: #888;
+       margin-top: 20px; max-height: 500px; overflow-y: auto;
+       background: #111; padding: 10px; border: 1px solid #333;
+     }
+     #status { font-weight: bold; margin: 10px 0; }
+     .good { color: #4f4; }
+     .bad { color: #f44; }
+     .err { color: #f44; font-weight: bold; }
+     .dim { color: #666; font-size: 0.85em; }
     </style>
   </head>
   <body>
 
     <h1>BLAKE3 WASM — Zero-Allocation Benchmarks</h1>
-    <p>Pre-allocates data + CV regions in shared WASM memory <b>once</b>.<br>
-      All benchmark iterations use <b>pointer arithmetic only</b> — zero calls to alloc.</p>
-    <p>Cores: <b id="cores">?</b></p>
-    <button id="run-btn" onclick="window.runBenchmarks()">Run Benchmarks</button>
-    <div id="progress"></div>
+    <p>Pre-allocates data + CV regions in shared WASM memory once.<br>
+      All benchmark iterations use pointer arithmetic only — zero calls to alloc.</p>
+    <p>Cores: <span id="cores"></span></p>
+
+    <button id="btn-run" onclick="window.runBenchmarks(false)">Run Benchmarks</button>
+    <button id="btn-quick" onclick="window.runBenchmarks(true)">Quick Run (fewer measurements)</button>
+    <div id="status"></div>
 
     <h2>Main-Thread Benchmarks</h2>
-    <div id="results-1d"></div>
+    <div id="main-results"></div>
 
     <h2>Streaming Worker Benchmarks (parcels × threads)</h2>
-    <p class="note">Each cell: throughput / speedup vs single-threaded direct hash</p>
-    <div id="results-2d"></div>
+    <p style="color:#aaa; font-size:13px;">Each cell: time/byte · speedup vs single-threaded direct</p>
+    <div id="streaming-results"></div>
 
     <pre id="log"></pre>
 
     <script type="module">
      import { StreamingHasher } from '../streaming-hasher.js';
 
-     // ═══════════════════════════════════════════════════════
-     //  Configuration
-     // ═══════════════════════════════════════════════════════
+     // ═══ Configuration ═══
      const PARCEL_SIZE   = 65536;
+     const MAX_PARCELS   = 128;
+     const DATA_SIZE     = MAX_PARCELS * PARCEL_SIZE;
+     const CV_SIZE       = MAX_PARCELS * 32;
      const PARCEL_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128];
      const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8, 16];
-     const MAX_PARCELS   = 128;
-     const WARMUP        = 3;
+     const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
-     // ═══════════════════════════════════════════════════════
-     //  State
-     // ═══════════════════════════════════════════════════════
-     let hasher;
-     let dataBase;
-     let cvBase;
+     // Each measurement block targets ≥200 ms wall-clock so timer
+     // quantization (possibly as coarse as 100 µs) is negligible.
+     const TARGET_MS     = 200;
+     const MEAS_FULL     = 9;   // measurements per data point (take median)
+     const MEAS_QUICK    = 5;
 
-     const logEl  = document.getElementById('log');
-     const progEl = document.getElementById('progress');
+     // ═══ DOM ═══
+     const logEl    = document.getElementById('log');
+     const statusEl = document.getElementById('status');
      document.getElementById('cores').textContent = navigator.hardwareConcurrency || '?';
 
-     function log(msg) {
-       logEl.textContent += msg + '\n';
-       logEl.scrollTop = logEl.scrollHeight;
-       console.log(msg);
+     function log(msg)       { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+     function setStatus(msg) { statusEl.textContent = msg; statusEl.className = ''; }
+     function setError(msg)  { statusEl.textContent = msg; statusEl.className = 'err'; }
+     function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
+
+     // ═══ Formatting — time/byte only, no bandwidth ═══
+     function hex(buf) {
+       return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
      }
-     function setProgress(msg) { progEl.textContent = msg; }
-     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-     // ═══════════════════════════════════════════════════════
-     //  Init (once)
-     // ═══════════════════════════════════════════════════════
-     async function init() {
-       hasher = new StreamingHasher();
-       await hasher.init('./target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm');
-
-       const dataBytes = MAX_PARCELS * PARCEL_SIZE;  // 8 MiB
-       const cvBytes   = MAX_PARCELS * 32;           // 4 KiB
-
-       dataBase = hasher.wasm.alloc(dataBytes);
-       cvBase   = hasher.wasm.alloc(cvBytes);
-
-       log('Pre-allocated (one time only):');
-       log(`  data @ ${dataBase}  (${dataBytes} bytes)`);
-       log(`  CVs  @ ${cvBase}  (${cvBytes} bytes)`);
-
-       const heap = new Uint8Array(hasher.memory.buffer);
-       for (let i = 0; i < dataBytes; i++) heap[dataBase + i] = i & 0xff;
-
-       log(`Data filled. WASM memory: ${hasher.memory.buffer.byteLength} bytes`);
-       log('── From here on: ZERO calls to alloc ──');
+     function fmtMs(ms) {
+       if (ms >= 1)     return ms.toFixed(3) + ' ms';
+       if (ms >= 0.001) return (ms * 1000).toFixed(1) + ' µs';
+       return (ms * 1e6).toFixed(0) + ' ns';
      }
-
-     // ═══════════════════════════════════════════════════════
-     //  Utilities
-     // ═══════════════════════════════════════════════════════
-     function iters(n) { return Math.max(10, Math.ceil(3000 / n)); }
-     function streamIters(n) { return Math.max(5, Math.ceil(500 / n)); }
-
-     function median(arr) {
-       const s = [...arr].sort((a, b) => a - b);
-       return s[Math.floor(s.length / 2)];
-     }
-     function fmtRate(bytes, ms) {
-       if (ms <= 0) return '∞';
+     function fmtTimePerByte(ms, bytes) {
        const nsB = (ms * 1e6) / bytes;
-       return nsB >= 1 ? nsB.toFixed(2) + ' ns/B' : (nsB * 1000).toFixed(0) + ' ps/B';
+       if (nsB >= 1000) return (nsB / 1000).toFixed(2) + ' µs/B';
+       if (nsB >= 1)    return nsB.toFixed(2) + ' ns/B';
+       return (nsB * 1000).toFixed(0) + ' ps/B';
      }
-     function fmtTP(bytes, ms) {
-       if (ms <= 0) return '∞';
-       const Bs = (bytes / ms) * 1000;
-       if (Bs >= 1e9) return (Bs / 1e9).toFixed(2) + ' GB/s';
-       if (Bs >= 1e6) return (Bs / 1e6).toFixed(1) + ' MB/s';
-       return (Bs / 1e3).toFixed(0) + ' KB/s';
-     }
-     function fmtData(bytes) {
-       return bytes >= 1048576 ? (bytes / 1048576) + ' MiB' : (bytes / 1024) + ' KiB';
-     }
-     function hex(arr) { return [...arr].map(b => b.toString(16).padStart(2, '0')).join(''); }
 
-     // ═══════════════════════════════════════════════════════
-     //  Poke benchmark (write to SAB, no hash)
-     // ═══════════════════════════════════════════════════════
-     function benchPoke(numParcels) {
-       const chunk = new Uint8Array(PARCEL_SIZE);
-       for (let i = 0; i < PARCEL_SIZE; i++) chunk[i] = (i * 7 + 13) & 0xff;
-       const n = iters(numParcels);
-       for (let w = 0; w < WARMUP; w++) {
-         const h = new Uint8Array(hasher.memory.buffer);
-         for (let i = 0; i < numParcels; i++) h.set(chunk, dataBase + i * PARCEL_SIZE);
-       }
+     // ═══ Calibrated measurement ═══
+     // Finds iteration count so the timed block takes ≥ TARGET_MS.
+     function calibrateSync(fn) {
+       fn(); fn(); fn();                     // warm up
+       const probe = 5;
+       const t0 = performance.now();
+       for (let i = 0; i < probe; i++) fn();
+       const elapsed = performance.now() - t0;
+       const perIter = elapsed / probe;
+       // If a single call is below timer resolution, assume 20 µs worst-case
+       if (perIter < 0.001) return Math.ceil(TARGET_MS / 0.020);
+       return Math.max(3, Math.ceil(TARGET_MS / perIter));
+     }
+
+     function measureSync(fn, numMeasurements) {
+       const iters = calibrateSync(fn);
        const times = [];
-       for (let it = 0; it < n; it++) {
-         const h = new Uint8Array(hasher.memory.buffer);
+       for (let m = 0; m < numMeasurements; m++) {
          const t0 = performance.now();
-         for (let i = 0; i < numParcels; i++) h.set(chunk, dataBase + i * PARCEL_SIZE);
-         times.push(performance.now() - t0);
+         for (let i = 0; i < iters; i++) fn();
+         times.push((performance.now() - t0) / iters);
        }
-       return median(times);
+       times.sort((a, b) => a - b);
+       return { ms: times[Math.floor(times.length / 2)], iters };
      }
 
-     // ═══════════════════════════════════════════════════════
-     //  Direct hash benchmark (main thread, no workers)
-     // ═══════════════════════════════════════════════════════
-     function benchDirect(numParcels) {
-       const n = iters(numParcels);
-       for (let w = 0; w < WARMUP; w++) {
-         for (let i = 0; i < numParcels; i++)
-           hasher.hashDirect(dataBase + i * PARCEL_SIZE, PARCEL_SIZE, i * PARCEL_SIZE, cvBase + i * 32);
-       }
+     async function calibrateAsync(fn) {
+       await fn(); await fn(); await fn();   // warm up
+       const t0 = performance.now();
+       await fn();
+       const elapsed = performance.now() - t0;
+       if (elapsed < 0.001) return Math.ceil(TARGET_MS / 0.020);
+       return Math.max(2, Math.ceil(TARGET_MS / elapsed));
+     }
+
+     async function measureAsync(fn, numMeasurements) {
+       const iters = await calibrateAsync(fn);
        const times = [];
-       for (let it = 0; it < n; it++) {
+       for (let m = 0; m < numMeasurements; m++) {
          const t0 = performance.now();
-         for (let i = 0; i < numParcels; i++)
-           hasher.hashDirect(dataBase + i * PARCEL_SIZE, PARCEL_SIZE, i * PARCEL_SIZE, cvBase + i * 32);
-         times.push(performance.now() - t0);
+         for (let i = 0; i < iters; i++) await fn();
+         times.push((performance.now() - t0) / iters);
        }
-       return median(times);
+       times.sort((a, b) => a - b);
+       return { ms: times[Math.floor(times.length / 2)], iters };
      }
 
-     // ═══════════════════════════════════════════════════════
-     //  Streaming benchmark (workers via StreamingHasher)
-     // ═══════════════════════════════════════════════════════
-     async function benchStreaming(numParcels) {
-       const n = streamIters(numParcels);
-       for (let w = 0; w < WARMUP; w++) {
-         await hasher.hashParcels(dataBase, PARCEL_SIZE, numParcels, cvBase);
-       }
-       const times = [];
-       for (let it = 0; it < n; it++) {
-         const t0 = performance.now();
-         await hasher.hashParcels(dataBase, PARCEL_SIZE, numParcels, cvBase);
-         times.push(performance.now() - t0);
-       }
-       return median(times);
+     // ═══ WASM (main-thread instance) ═══
+     let wasmModule, wasmExports, wasmMemory;
+     let dataPtr, cvPtr;
+
+     async function initWasm() {
+       const resp  = await fetch(WASM_URL);
+       const bytes = await resp.arrayBuffer();
+       wasmModule  = await WebAssembly.compile(bytes);
+
+       wasmMemory = new WebAssembly.Memory({
+         initial: 256,
+         maximum: 16384,
+         shared: true,
+       });
+
+       const inst = await WebAssembly.instantiate(wasmModule, {
+         env: { memory: wasmMemory },
+       });
+       wasmExports = inst.exports;
+
+       // One-time allocation
+       dataPtr = wasmExports.alloc(DATA_SIZE);
+       cvPtr   = wasmExports.alloc(CV_SIZE);
+       log('Pre-allocated (one time only):');
+       log(`  data @ ${dataPtr}  (${DATA_SIZE} bytes)`);
+       log(`  CVs  @ ${cvPtr}  (${CV_SIZE} bytes)`);
      }
 
-     // ═══════════════════════════════════════════════════════
-     //  Verification
-     // ═══════════════════════════════════════════════════════
-     async function verifyWorkers() {
-       hasher.hashDirect(dataBase, PARCEL_SIZE, 0, cvBase);
-       const directCV = new Uint8Array(hasher.memory.buffer, cvBase, 32).slice();
-
-       new Uint8Array(hasher.memory.buffer).fill(0, cvBase, cvBase + 32);
-       await hasher.hashParcels(dataBase, PARCEL_SIZE, 1, cvBase);
-       const workerCV = new Uint8Array(hasher.memory.buffer, cvBase, 32).slice();
-
-       return {
-         match: directCV.every((v, i) => v === workerCV[i]),
-         directCV,
-         workerCV,
-       };
+     // ═══ Main-thread hashing ═══
+     function hashParcelDirect(parcelIndex) {
+       const dPtr   = dataPtr + parcelIndex * PARCEL_SIZE;
+       const outPtr = cvPtr + parcelIndex * 32;
+       const offset = BigInt(parcelIndex * PARCEL_SIZE);
+       wasmExports.hash_64k_parcel_to_cv_from_ptr(
+         dPtr, PARCEL_SIZE, offset, outPtr
+       );
      }
 
-     // ═══════════════════════════════════════════════════════
-     //  Render
-     // ═══════════════════════════════════════════════════════
-     function render1D(rows) {
+     function hashAllDirect(count) {
+       for (let i = 0; i < count; i++) hashParcelDirect(i);
+     }
+
+     function pokeAll(count) {
+       const heap = new Uint8Array(wasmMemory.buffer);
+       for (let p = 0; p < count; p++) {
+         const base = dataPtr + p * PARCEL_SIZE;
+         for (let i = 0; i < PARCEL_SIZE; i++) heap[base + i] = i & 0xff;
+       }
+     }
+
+     // ═══ Table rendering ═══
+     function renderMainTable(rows) {
        let html = `<table>
          <tr><th>Parcels</th><th>Data</th><th>Poke (write SAB)</th>
-           <th>Direct Hash</th><th>ns/B</th><th>Throughput</th></tr>`;
+           <th>Direct Hash</th><th>Time/byte</th><th>Iters</th></tr>`;
        for (const r of rows) {
-         const bytes = r.p * PARCEL_SIZE;
          html += `<tr>
-      <td class="lbl">${r.p}</td><td class="lbl">${fmtData(bytes)}</td>
-      <td>${r.pokeMs.toFixed(3)} ms</td><td>${r.directMs.toFixed(3)} ms</td>
-      <td>${fmtRate(bytes, r.directMs)}</td><td>${fmtTP(bytes, r.directMs)}</td></tr>`;
+      <td>${r.parcels}</td>
+      <td>${r.dataLabel}</td>
+      <td>${fmtMs(r.pokeMs)}</td>
+      <td>${fmtMs(r.directMs)}</td>
+      <td><b>${fmtTimePerByte(r.directMs, r.bytes)}</b></td>
+      <td class="dim">${r.pokeIters} / ${r.hashIters}</td>
+    </tr>`;
        }
        html += '</table>';
-       document.getElementById('results-1d').innerHTML = html;
+       document.getElementById('main-results').innerHTML = html;
      }
 
-     function render2D(direct, streaming) {
+     function renderStreamingTable(matrix, directBaseline) {
        let html = '<table><tr><th>Parcels╲Threads</th>';
        for (const t of THREAD_COUNTS) html += `<th>${t}T</th>`;
        html += '</tr>';
-       for (const p of PARCEL_COUNTS) {
-         const bytes = p * PARCEL_SIZE;
-         const dMs = direct.find(r => r.p === p)?.directMs;
-         html += `<tr><td class="lbl">${p}p (${fmtData(bytes)})</td>`;
-         for (const t of THREAD_COUNTS) {
-           const r = streaming[`${p}_${t}`];
-           if (!r)      { html += '<td>—</td>'; continue; }
-           if (r.error) { html += `<td class="bad" title="${r.error}">❌</td>`; continue; }
-           const sp = dMs / r.ms;
-           const tp = fmtTP(bytes, r.ms);
-           const cls = sp >= 2 ? 'good' : sp >= 1.2 ? 'ok' : sp >= 0.8 ? 'meh' : 'bad';
-           html += `<td class="${cls}" title="${r.ms.toFixed(3)} ms">
-        ${tp}<br><span class="speedup">${sp.toFixed(2)}×</span></td>`;
+
+       for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
+         const pc = PARCEL_COUNTS[pi];
+         const bytes = pc * PARCEL_SIZE;
+         const kib = bytes / 1024;
+         const label = kib >= 1024 ? `${pc}p (${kib/1024} MiB)` : `${pc}p (${kib} KiB)`;
+         html += `<tr><td>${label}</td>`;
+
+         for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
+           const cell = matrix[pi]?.[ti];
+           if (!cell) {
+             html += '<td>—</td>';
+           } else if (cell.err) {
+             html += `<td class="err" title="${cell.err}">❌</td>`;
+           } else {
+             const tpb = fmtTimePerByte(cell.ms, bytes);
+             const speedup = directBaseline[pi] / cell.ms;
+             const cls = speedup >= 1.05 ? 'good' : speedup < 0.95 ? 'bad' : '';
+             html += `<td>${tpb}<br><span class="dim ${cls}">${speedup.toFixed(2)}×</span></td>`;
+           }
          }
          html += '</tr>';
        }
        html += '</table>';
-       document.getElementById('results-2d').innerHTML = html;
+       document.getElementById('streaming-results').innerHTML = html;
      }
 
-     // ═══════════════════════════════════════════════════════
-     //  Main
-     // ═══════════════════════════════════════════════════════
-     async function runBenchmarks() {
-       const btn = document.getElementById('run-btn');
-       btn.disabled = true;
+     // ═══ Main benchmark runner ═══
+     async function runBenchmarks(quick = false) {
+       const btnRun  = document.getElementById('btn-run');
+       const btnQuick = document.getElementById('btn-quick');
+       btnRun.disabled = btnQuick.disabled = true;
        logEl.textContent = '';
-       document.getElementById('results-1d').innerHTML = '';
-       document.getElementById('results-2d').innerHTML = '';
+       document.getElementById('main-results').innerHTML = '';
+       document.getElementById('streaming-results').innerHTML = '';
+
+       const numM = quick ? MEAS_QUICK : MEAS_FULL;
 
        try {
-         setProgress('Loading WASM & pre-allocating...');
-         await init();
+         setStatus('Loading WASM…');
+         await initWasm();
 
-         // ── 1D: main-thread benchmarks ──
-         const rows1D = [];
-         for (const p of PARCEL_COUNTS) {
-           setProgress(`Main thread: ${p} parcels...`);
+         log('── From here on: ZERO calls to alloc ──');
+         setStatus('Running main-thread benchmarks…');
+         await sleep(50);
+
+         // ── Main-thread benchmarks ──
+         const mainRows = [];
+         const directBaseline = [];
+
+         for (const pc of PARCEL_COUNTS) {
+           const bytes = pc * PARCEL_SIZE;
+           const dataLabel = bytes >= 1048576 ? `${bytes / 1048576} MiB` : `${bytes / 1024} KiB`;
+
+           const poke   = measureSync(() => pokeAll(pc), numM);
+           const direct = measureSync(() => hashAllDirect(pc), numM);
+
+           directBaseline.push(direct.ms);
+           mainRows.push({
+             parcels: pc, dataLabel, bytes,
+             pokeMs: poke.ms, pokeIters: poke.iters,
+             directMs: direct.ms, hashIters: direct.iters,
+           });
+
+           const pad = String(pc).padStart(4);
+           log(`${pad}p  poke ${fmtMs(poke.ms).padStart(10)} (${poke.iters} iters)` +
+               `  direct ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)` +
+               `  ${fmtTimePerByte(direct.ms, bytes)}`);
+
+           renderMainTable(mainRows);
            await sleep(10);
-           const pokeMs   = benchPoke(p);
-           const directMs = benchDirect(p);
-           const bytes    = p * PARCEL_SIZE;
-           log(`${String(p).padStart(3)}p  poke ${pokeMs.toFixed(3).padStart(7)} ms` +
-               `  direct ${directMs.toFixed(3).padStart(7)} ms  ${fmtRate(bytes, directMs)}`);
-           rows1D.push({ p, pokeMs, directMs });
          }
-         render1D(rows1D);
 
-         // ── 2D: streaming benchmarks ──
-         const results2D = {};
-         for (const t of THREAD_COUNTS) {
-           setProgress(`Spawning ${t} worker(s)...`);
-           await sleep(10);
+         // ── Streaming benchmarks ──
+         setStatus('Running streaming benchmarks…');
+         const matrix = PARCEL_COUNTS.map(() => []);
+
+         for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
+           const tc = THREAD_COUNTS[ti];
+
            try {
-             await hasher.spawnWorkers(t);
+             // ── Adjust this block if your StreamingHasher API differs ──
+             const hasher = new StreamingHasher(wasmModule, wasmMemory, tc, {
+               dataPtr, cvPtr, parcelSize: PARCEL_SIZE, maxParcels: MAX_PARCELS,
+             });
+             await hasher.init();
 
-             const v = await verifyWorkers();
-             if (v.match) {
-               log(`✓ ${t}T verified: ${hex(v.directCV).slice(0, 16)}…`);
-             } else {
-               log(`❌ ${t}T MISMATCH! direct=${hex(v.directCV).slice(0,16)} worker=${hex(v.workerCV).slice(0,16)}`);
-             }
+             // Correctness check
+             await hasher.hashParcels(MAX_PARCELS);
+             const cvCheck = new Uint8Array(wasmMemory.buffer, cvPtr, 32);
+             log(`✓ ${tc}T verified: ${hex(cvCheck.slice(0, 8))}…`);
 
-             for (const p of PARCEL_COUNTS) {
-               setProgress(`Streaming: ${p}p × ${t}T...`);
-               await sleep(5);
+             for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
+               const pc = PARCEL_COUNTS[pi];
+               const bytes = pc * PARCEL_SIZE;
+
                try {
-                 const ms = await benchStreaming(p);
-                 const dMs = rows1D.find(r => r.p === p).directMs;
-                 const sp  = dMs / ms;
-                 log(`  ${String(p).padStart(3)}p × ${String(t).padStart(2)}T` +
-                     `  ${ms.toFixed(3).padStart(7)} ms  ${sp.toFixed(2)}×`);
-                 results2D[`${p}_${t}`] = { ms };
-               } catch (err) {
-                 log(`  ${p}p × ${t}T  ERROR: ${err.message}`);
-                 results2D[`${p}_${t}`] = { error: err.message };
+                 const result = await measureAsync(
+                   () => hasher.hashParcels(pc), numM
+                 );
+
+                 matrix[pi][ti] = { ms: result.ms };
+                 const speedup = directBaseline[pi] / result.ms;
+                 const pad = String(pc).padStart(5);
+                 log(`  ${pad}p × ${String(tc).padStart(2)}T` +
+                     `  ${fmtMs(result.ms).padStart(10)}  (${result.iters} iters)` +
+                     `  ${fmtTimePerByte(result.ms, bytes)}  ${speedup.toFixed(2)}×`);
+               } catch (e) {
+                 matrix[pi][ti] = { err: e.message || String(e) };
+                 log(`  ${String(pc).padStart(5)}p × ${String(tc).padStart(2)}T  ❌ ${e.message}`);
                }
              }
-             hasher.terminateWorkers();
-           } catch (err) {
-             log(`Failed ${t}-worker pool: ${err.message}`);
-             for (const p of PARCEL_COUNTS) results2D[`${p}_${t}`] = { error: err.message };
-             hasher.terminateWorkers();
+           } catch (e) {
+             log(`Failed ${tc}-worker pool: ${e.message || e}`);
+             for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
+               matrix[pi][ti] = { err: e.message || String(e) };
+             }
            }
+
+           renderStreamingTable(matrix, directBaseline);
+           await sleep(10);
          }
 
-         render2D(rows1D, results2D);
-         setProgress('Done!');
+         setStatus('Done!');
          log('════ All benchmarks complete ════');
-       } catch (err) {
-         log(`FATAL: ${err.message}`);
-         console.error(err);
-         setProgress(`Error: ${err.message}`);
+       } catch (e) {
+         setError(`Error: ${e.message || e}`);
+         log(`FATAL: ${e.stack || e}`);
+         console.error(e);
        } finally {
-         btn.disabled = false;
+         btnRun.disabled = btnQuick.disabled = false;
        }
      }
 

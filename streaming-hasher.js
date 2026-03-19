@@ -20,34 +20,27 @@ function buildImports(wasmModule, memory) {
 }
 
 export class StreamingHasher {
-    constructor() {
+    constructor(wasmModule, memory, workerCount, { dataPtr, cvPtr, parcelSize, maxParcels }) {
         this.workers = [];
-        this.wasm = null;       // main-thread instance.exports
-        this.memory = null;     // shared WebAssembly.Memory
-        this.wasmModule = null; // compiled WebAssembly.Module
+        this.wasm = null;
+        this.memory = memory;
+        this.wasmModule = wasmModule;
         this.pendingTasks = new Map();
         this.nextTaskId = 0;
         this.inflightPerWorker = [];
+
+        this.workerCount = workerCount;
+        this.dataPtr = dataPtr;
+        this.cvPtr = cvPtr;
+        this.parcelSize = parcelSize;
+        this.maxParcels = maxParcels;
     }
 
-    /**
-     * Compile the WASM module and create a main-thread instance.
-     * Does NOT spawn workers — call spawnWorkers() separately.
-     */
-    async init(wasmPath = '.../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm') {
-        this.memory = new WebAssembly.Memory({
-            initial: 256,
-            maximum: 16384,
-            shared: true,
-        });
-
-        const url = new URL(wasmPath, import.meta.url).href;
-        this.wasmModule = await WebAssembly.compileStreaming(fetch(url));
-
+    async init() {
         const imports = buildImports(this.wasmModule, this.memory);
         const instance = await WebAssembly.instantiate(this.wasmModule, imports);
-        console.log('xxx instantiate result:', instance);
         this.wasm = instance.exports;
+        await this.spawnWorkers(this.workerCount);
     }
 
     /**
@@ -147,18 +140,14 @@ export class StreamingHasher {
         return this.#dispatch([{ dataPtr, size, offset, cvPtr }]);
     }
 
-    /**
-     * Hash numParcels consecutive parcels, distributing across all workers.
-     * One postMessage per worker (batch dispatch). Returns when all done.
-     */
-    hashParcels(dataBase, parcelSize, numParcels, cvBase) {
+    hashParcels(numParcels) {
         const jobsPerWorker = Array.from({ length: this.workers.length }, () => []);
         for (let i = 0; i < numParcels; i++) {
             jobsPerWorker[i % this.workers.length].push({
-                dataPtr: dataBase + i * parcelSize,
-                size: parcelSize,
-                offset: i * parcelSize,
-                cvPtr: cvBase + i * CV_LEN,
+                dataPtr: this.dataPtr + i * this.parcelSize,
+                size: this.parcelSize,
+                offset: i * this.parcelSize,
+                cvPtr: this.cvPtr + i * CV_LEN,
             });
         }
         const promises = [];
