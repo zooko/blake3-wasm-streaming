@@ -54,16 +54,15 @@
 
      // ═══ Configuration ═══
      const PARCEL_SIZE   = 65536;
-     const MAX_PARCELS   = 128;
+     const MAX_PARCELS   = 512;
      const DATA_SIZE     = MAX_PARCELS * PARCEL_SIZE;
      const CV_SIZE       = MAX_PARCELS * 32;
-     const PARCEL_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128];
-     const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8, 16];
+     const PARCEL_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+     const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8, 16, 20, 24, 32];
      const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
      // Each measurement block targets ≥200 ms wall-clock so timer
      // quantization (possibly as coarse as 100 µs) is negligible.
-     const TARGET_MS     = 200;
      const MEAS_FULL     = 9;   // measurements per data point (take median)
      const MEAS_QUICK    = 5;
 
@@ -94,8 +93,8 @@
      }
 
      // ═══ Calibrated measurement ═══
-     // Finds iteration count so the timed block takes ≥ TARGET_MS.
-     function calibrateSync(fn) {
+     // Finds iteration count so the timed block takes ≥ targetMs.
+     function calibrateSync(fn, targetMs) {
        fn(); fn(); fn();                     // warm up
        const probe = 5;
        const t0 = performance.now();
@@ -103,12 +102,12 @@
        const elapsed = performance.now() - t0;
        const perIter = elapsed / probe;
        // If a single call is below timer resolution, assume 20 µs worst-case
-       if (perIter < 0.001) return Math.ceil(TARGET_MS / 0.020);
-       return Math.max(3, Math.ceil(TARGET_MS / perIter));
+       if (perIter < 0.001) return Math.ceil(targetMs / 0.020);
+       return Math.max(3, Math.ceil(targetMs / perIter));
      }
 
-     function measureSync(fn, numMeasurements) {
-       const iters = calibrateSync(fn);
+     function measureSync(fn, numMeasurements, targetMs) {
+       const iters = calibrateSync(fn, targetMs);
        const times = [];
        for (let m = 0; m < numMeasurements; m++) {
          const t0 = performance.now();
@@ -124,8 +123,8 @@
        const t0 = performance.now();
        await fn();
        const elapsed = performance.now() - t0;
-       if (elapsed < 0.001) return Math.ceil(TARGET_MS / 0.020);
-       return Math.max(2, Math.ceil(TARGET_MS / elapsed));
+       if (elapsed < 0.001) return Math.ceil(targetMs / 0.020);
+       return Math.max(2, Math.ceil(targetMs / elapsed));
      }
 
      async function measureAsync(fn, numMeasurements) {
@@ -150,8 +149,8 @@
        wasmModule  = await WebAssembly.compile(bytes);
 
        wasmMemory = new WebAssembly.Memory({
-         initial: 256,
-         maximum: 16384,
+         initial: 512,
+         maximum: 65536,
          shared: true,
        });
 
@@ -244,6 +243,7 @@
      async function runBenchmarks(quick = false) {
        const btnRun  = document.getElementById('btn-run');
        const btnQuick = document.getElementById('btn-quick');
+       const targetMs = quick ? 40 : 200;
        btnRun.disabled = btnQuick.disabled = true;
        logEl.textContent = '';
        document.getElementById('main-results').innerHTML = '';
@@ -267,8 +267,8 @@
            const bytes = pc * PARCEL_SIZE;
            const dataLabel = bytes >= 1048576 ? `${bytes / 1048576} MiB` : `${bytes / 1024} KiB`;
 
-           const poke   = measureSync(() => pokeAll(pc), numM);
-           const direct = measureSync(() => hashAllDirect(pc), numM);
+           const poke   = measureSync(() => pokeAll(pc), numM, targetMs);
+           const direct = measureSync(() => hashAllDirect(pc), numM, targetMs);
 
            directBaseline.push(direct.ms);
            mainRows.push({

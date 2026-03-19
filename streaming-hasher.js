@@ -141,7 +141,23 @@ export class StreamingHasher {
     }
 
     hashParcels(numParcels) {
-        const jobsPerWorker = Array.from({ length: this.workers.length }, () => []);
+        if (!Number.isInteger(numParcels)) {
+            throw new Error(`hashParcels: numParcels must be int, got ${numParcels}`);
+        }
+        if (numParcels < 0 || numParcels > this.maxParcels) {
+            throw new Error(
+                `hashParcels: numParcels=${numParcels} out of range 0..${this.maxParcels}`,
+            );
+        }
+        if (this.workers.length === 0) {
+            throw new Error('hashParcels: no workers');
+        }
+
+        const jobsPerWorker = Array.from(
+            { length: this.workers.length },
+            () => [],
+        );
+
         for (let i = 0; i < numParcels; i++) {
             jobsPerWorker[i % this.workers.length].push({
                 dataPtr: this.dataPtr + i * this.parcelSize,
