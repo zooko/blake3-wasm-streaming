@@ -1,41 +1,39 @@
 use core::{ptr, slice};
 use std::mem;
-use wasm_bindgen::prelude::*;
 
 const PARCEL_LEN: usize = 64 * 1024;
 const CV_LEN: usize = 32;
 
 // ── Memory helpers ──────────────────────────────────────────
 
-#[wasm_bindgen]
-pub fn alloc(bytes: usize) -> usize {
+#[no_mangle]
+pub extern "C" fn alloc(bytes: usize) -> usize {
     let mut v = Vec::<u8>::with_capacity(bytes);
     let ptr = v.as_mut_ptr() as usize;
     mem::forget(v);
     ptr
 }
 
-#[wasm_bindgen]
-pub unsafe fn dealloc(ptr: usize, bytes: usize) {
+#[no_mangle]
+pub unsafe extern "C" fn dealloc(ptr: usize, bytes: usize) {
     let _ = Vec::<u8>::from_raw_parts(ptr as *mut u8, 0, bytes);
 }
 
-#[wasm_bindgen]
-pub fn out_len() -> usize {
+#[no_mangle]
+pub extern "C" fn out_len() -> usize {
     CV_LEN
 }
 
 // ── Single-parcel hashing ───────────────────────────────────
 
 #[inline]
-pub fn hash_64k_parcel_to_cv(parcel: &[u8], input_offset: u64) -> [u8; CV_LEN] {
+fn hash_64k_parcel_to_cv(parcel: &[u8], input_offset: u64) -> [u8; CV_LEN] {
     debug_assert!(parcel.len() == PARCEL_LEN);
-
     blake3::hash_subtree_cv(parcel, input_offset)
 }
 
-#[wasm_bindgen]
-pub fn hash_64k_parcel_to_cv_from_ptr(
+#[no_mangle]
+pub extern "C" fn hash_64k_parcel_to_cv_from_ptr(
     input_ptr: usize,
     input_len: usize,
     input_offset: u64,
@@ -50,34 +48,8 @@ pub fn hash_64k_parcel_to_cv_from_ptr(
 
 // ── Batch-parcel hashing ────────────────────────────────────
 
-#[inline]
-pub fn hash_64k_parcels_to_cvs(input: &[u8], out: &mut [u8], input_offset: u64) -> usize {
-    let num_parcels = input.len() / PARCEL_LEN;
-
-    debug_assert!(input.len() % PARCEL_LEN == 0);
-    debug_assert!(out.len() >= num_parcels * CV_LEN);
-
-    let mut inp = input.as_ptr();
-    let mut outp = out.as_mut_ptr();
-    let mut offset = input_offset;
-
-    for _ in 0..num_parcels {
-        let parcel = unsafe { slice::from_raw_parts(inp, PARCEL_LEN) };
-        let cv = hash_64k_parcel_to_cv(parcel, offset);
-
-        unsafe {
-            ptr::copy_nonoverlapping(cv.as_ptr(), outp, CV_LEN);
-            inp = inp.add(PARCEL_LEN);
-            outp = outp.add(CV_LEN);
-        }
-        offset = offset.wrapping_add(PARCEL_LEN as u64);
-    }
-
-    num_parcels
-}
-
-#[wasm_bindgen]
-pub fn hash_64k_parcels_to_cvs_from_ptr(
+#[no_mangle]
+pub extern "C" fn hash_64k_parcels_to_cvs_from_ptr(
     input_ptr: usize,
     input_len: usize,
     input_offset: u64,
@@ -89,14 +61,37 @@ pub fn hash_64k_parcels_to_cvs_from_ptr(
     hash_64k_parcels_to_cvs(input, out, input_offset)
 }
 
+#[inline]
+fn hash_64k_parcels_to_cvs(input: &[u8], out: &mut [u8], input_offset: u64) -> usize {
+    let num_parcels = input.len() / PARCEL_LEN;
+    debug_assert!(input.len() % PARCEL_LEN == 0);
+    debug_assert!(out.len() >= num_parcels * CV_LEN);
+
+    let mut inp = input.as_ptr();
+    let mut outp = out.as_mut_ptr();
+    let mut offset = input_offset;
+
+    for _ in 0..num_parcels {
+        let parcel = unsafe { slice::from_raw_parts(inp, PARCEL_LEN) };
+        let cv = hash_64k_parcel_to_cv(parcel, offset);
+        unsafe {
+            ptr::copy_nonoverlapping(cv.as_ptr(), outp, CV_LEN);
+            inp = inp.add(PARCEL_LEN);
+            outp = outp.add(CV_LEN);
+        }
+        offset = offset.wrapping_add(PARCEL_LEN as u64);
+    }
+    num_parcels
+}
+
 // ── Sizing helpers ──────────────────────────────────────────
 
-#[wasm_bindgen]
-pub fn num_64k_parcels(input_len: usize) -> usize {
+#[no_mangle]
+pub extern "C" fn num_64k_parcels(input_len: usize) -> usize {
     input_len / PARCEL_LEN
 }
 
-#[wasm_bindgen]
-pub fn bytes_needed_for_64k_parcel_cvs(input_len: usize) -> usize {
+#[no_mangle]
+pub extern "C" fn bytes_needed_for_64k_parcel_cvs(input_len: usize) -> usize {
     input_len / PARCEL_LEN * CV_LEN
 }
