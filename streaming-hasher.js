@@ -1,42 +1,50 @@
 const CV_LEN = 32;
 const WORKER_STACK = 65536;
+const STACK_ALIGN = 16;
+
+function assert(cond, msg) {
+    if (!cond) throw new Error(msg);
+}
 
 export class StreamingHasher {
-    constructor(wasmModule, memory, workerCount, { dataPtr, cvPtr, parcelSize, maxParcels }) {
+    constructor(
+        wasmModule,
+        memory,
+        workerCount,
+        { dataPtr, cvPtr, stacksBase, parcelSize, maxParcels },
+    ) {
         this.workers = [];
-        this.wasm = null;
         this.memory = memory;
         this.wasmModule = wasmModule;
         this.pendingTasks = new Map();
         this.nextTaskId = 0;
         this.inflightPerWorker = [];
-
         this.workerCount = workerCount;
         this.dataPtr = dataPtr;
         this.cvPtr = cvPtr;
+        this.stacksBase = stacksBase;
         this.parcelSize = parcelSize;
         this.maxParcels = maxParcels;
     }
 
     async init() {
-        const instance = await WebAssembly.instantiate(this.wasmModule, {
-            env: { memory: this.memory },
-        });
-
-        this.wasm = instance.exports;
         await this.spawnWorkers(this.workerCount);
     }
 
-    /**
-     * Spawn (or replace) the worker pool.
-     * Each worker gets its own WASM instance sharing the same memory,
-     * with a dedicated stack region for thread safety.
-     */
     async spawnWorkers(count) {
-        this.terminateWorkers();
+        assert(this.workers.length === 0, 'spawnWorkers called more than once');
+        assert(this.inflightPerWorker.length === 0,
+            'spawnWorkers called after inflight state was created');
+       assert(this.pendingTasks.size === 0,
+            'spawnWorkers called with pending tasks still present');
 
-        // Allocate per-worker stack regions (leaked — acceptable for benchmark lifecycle)
-        const stacksBase = this.wasm.alloc(count * WORKER_STACK);
+        this.workers = [];
+
+        assert(Number.isInteger(count), `spawnWorkers: bad count ${count}`);
+        assert(count > 0, `spawnWorkers: count must be > 0, got ${count}`);
+        assert(this.stacksBase !== undefined, 'spawnWorkers: missing stacksBase');
+        assert(this.workerCount <= 0 || count <= this.workerCount, 'spawnWorkers: bad count');
+        assert(this.stacksBase % STACK_ALIGN === 0, `stacksBase not ${STACK_ALIGN}-byte aligned`);
 
         const readyPromises = [];
         for (let i = 0; i < count; i++) {
@@ -60,12 +68,13 @@ export class StreamingHasher {
                 };
             }));
 
-            // Stack grows downward — pass the top of this worker's region
+            const stackTop = this.stacksBase + (i + 1) * WORKER_STACK;
+            assert(stackTop % STACK_ALIGN === 0, `stackTop not ${STACK_ALIGN}-byte aligned`);
             w.postMessage({
                 type: 'init',
                 wasmModule: this.wasmModule,
                 memory: this.memory,
-                stackTop: stacksBase + (i + 1) * WORKER_STACK,
+                stackTop,
             });
 
             this.workers.push(w);
@@ -77,16 +86,6 @@ export class StreamingHasher {
         for (const w of this.workers) {
             w.onmessage = (e) => this.#handleResult(e.data);
         }
-    }
-
-    terminateWorkers() {
-        for (const w of this.workers) w.terminate();
-        this.workers = [];
-        this.inflightPerWorker = [];
-        for (const task of this.pendingTasks.values()) {
-            task.reject(new Error('workers terminated'));
-        }
-        this.pendingTasks.clear();
     }
 
     #handleResult(data) {
@@ -107,7 +106,10 @@ export class StreamingHasher {
     }
 
     #dispatch(jobs, workerIdx) {
-        if (workerIdx === undefined) workerIdx = this.#leastLoadedWorker();
+        // xxx re-add the feature of dispatching to the least loaded worker. But do not make `workerIdx` optional! Either remove `workerIdx` so that the only way to call this function is without specifying the nn
+
+        assert(workerIdx >= 0 && workerIdx < this.workers.length, `bad workerIdx ${workerIdx}`);
+
         const taskId = this.nextTaskId++;
         this.inflightPerWorker[workerIdx]++;
 
@@ -119,12 +121,15 @@ export class StreamingHasher {
         return promise;
     }
 
-    /** Dispatch a single parcel to a worker. offset is a plain Number. */
-    dispatchHash(dataPtr, size, offset, cvPtr) {
-        return this.#dispatch([{ dataPtr, size, offset, cvPtr }]);
-    }
-
+    //xxx we need to pass the starting offset
     hashParcels(numParcels) {
+        assert(Number.isInteger(numParcels), `hashParcels: numParcels must be int, got ${numParcels}`);
+        assert(
+            numParcels >= 0 && numParcels <= this.maxParcels,
+            `hashParcels: numParcels=${numParcels} out of range 0..${this.maxParcels}`,
+        );
+        assert(this.workers.length > 0, 'hashParcels: no workers');
+
         if (!Number.isInteger(numParcels)) {
             throw new Error(`hashParcels: numParcels must be int, got ${numParcels}`);
         }
@@ -146,7 +151,7 @@ export class StreamingHasher {
             jobsPerWorker[i % this.workers.length].push({
                 dataPtr: this.dataPtr + i * this.parcelSize,
                 size: this.parcelSize,
-                offset: i * this.parcelSize,
+                offset: BigInt(i) * BigInt(this.parcelSize),
                 cvPtr: this.cvPtr + i * CV_LEN,
             });
         }
@@ -157,10 +162,5 @@ export class StreamingHasher {
             }
         }
         return Promise.all(promises);
-    }
-
-    /** Main-thread direct hash (no workers). offset is a plain Number. */
-    hashDirect(dataPtr, size, offset, cvPtr) {
-        this.wasm.hash_64k_parcel_to_cv_from_ptr(dataPtr, size, BigInt(offset), cvPtr);
     }
 }

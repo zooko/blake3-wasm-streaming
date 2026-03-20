@@ -33,17 +33,13 @@
        padding: 10px;
        border: 1px solid #d1d5db;
      }
+     button { font-size: 16px; padding: 8px 20px; margin: 5px 5px 5px 0; cursor: pointer; }
+     button:disabled { opacity: 0.4; cursor: default; }
      .good { color: #166534; }
      .bad { color: #b91c1c; }
      .err { color: #b91c1c; font-weight: bold; }
      .dim { color: #6b7280; font-size: 0.85em; }
-     button { font-size: 16px; padding: 8px 20px; margin: 5px 5px 5px 0; cursor: pointer; }
-     button:disabled { opacity: 0.4; cursor: default; }
      #status { font-weight: bold; margin: 10px 0; }
-     .good { color: #4f4; }
-     .bad { color: #f44; }
-     .err { color: #f44; font-weight: bold; }
-     .dim { color: #666; font-size: 0.85em; }
     </style>
   </head>
   <body>
@@ -70,13 +66,19 @@
      import { StreamingHasher } from '../streaming-hasher.js';
 
      // ═══ Configuration ═══
-     const PARCEL_SIZE   = 65536;
+     const PARCEL_SIZE   = 256 * 1024;
      const MAX_PARCELS   = 512;
      const DATA_SIZE     = MAX_PARCELS * PARCEL_SIZE;
-     const CV_SIZE       = MAX_PARCELS * 32;
+     const CV_LEN        = 32;
+     const CV_SIZE       = MAX_PARCELS * CV_LEN;
      const PARCEL_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
      const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8, 16, 20, 24, 32];
      const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
+
+     const WORKER_STACK  = 65536;
+     const MAX_THREADS   = Math.max(...THREAD_COUNTS);
+     const PTR_ALIGN     = 16;
+     const WASM_PAGE     = 65536;
 
      // Each measurement block targets ≥200 ms wall-clock so timer
      // quantization (possibly as coarse as 100 µs) is negligible.
@@ -93,10 +95,30 @@
      function setError(msg)  { statusEl.textContent = msg; statusEl.className = 'err'; }
      function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
 
-     // ═══ Formatting — time/byte only, no bandwidth ═══
+     function assert(cond, msg) {
+       if (!cond) throw new Error(msg);
+     }
+     function alignUp(x, align) {
+       return Math.ceil(x / align) * align;
+     }
+     
+     // Hard-coded known-good vectors (full 32-byte CV hex).
+     const TEST_VECTORS = [
+       { parcel: 0,   expected: 'e0e5b812c75bbf82f2bd640467c09172c2bdba11a084239d3b735cca87ad091b' },
+       { parcel: 1,   expected: 'c0dd7ecdbab86ff239d661e06cd9917e9257e22f5fefd2fac4efe77138c93ad0' },
+       { parcel: 127, expected: 'eff4c05f399226f9d7829a746a07b2f8e93c84f2851292ad87ee2207538435f6' },
+     ];
      function hex(buf) {
        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
      }
+     function assertEqHex(label, actual, expected) {
+       if (actual !== expected) {
+         throw new Error(
+           `${label} mismatch\nexpected: ${expected}\nactual:   ${actual}`,
+         );
+       }
+     }
+
      function fmtMs(ms) {
        if (ms >= 1)     return ms.toFixed(3) + ' ms';
        if (ms >= 0.001) return (ms * 1000).toFixed(1) + ' µs';
@@ -135,7 +157,7 @@
        return { ms: times[Math.floor(times.length / 2)], iters };
      }
 
-     async function calibrateAsync(fn) {
+     async function calibrateAsync(fn, targetMs) {
        await fn(); await fn(); await fn();   // warm up
        const t0 = performance.now();
        await fn();
@@ -144,8 +166,8 @@
        return Math.max(2, Math.ceil(targetMs / elapsed));
      }
 
-     async function measureAsync(fn, numMeasurements) {
-       const iters = await calibrateAsync(fn);
+     async function measureAsync(fn, numMeasurements, targetMs) {
+       const iters = await calibrateAsync(fn, targetMs);
        const times = [];
        for (let m = 0; m < numMeasurements; m++) {
          const t0 = performance.now();
@@ -158,7 +180,7 @@
 
      // ═══ WASM (main-thread instance) ═══
      let wasmModule, wasmExports, wasmMemory;
-     let dataPtr, cvPtr;
+     let dataPtr, cvPtr, stacksBase;
 
      async function initWasm() {
        const resp  = await fetch(WASM_URL);
@@ -176,19 +198,44 @@
        });
        wasmExports = inst.exports;
 
-       // One-time allocation
-       dataPtr = wasmExports.alloc(DATA_SIZE);
-       cvPtr   = wasmExports.alloc(CV_SIZE);
-       log('Pre-allocated (one time only):');
+       assert(
+         wasmExports.__heap_base instanceof WebAssembly.Global,
+         'missing exported __heap_base',
+       );
+
+       const heapBase = wasmExports.__heap_base.value;
+       dataPtr = alignUp(heapBase, PTR_ALIGN);
+       cvPtr = alignUp(dataPtr + DATA_SIZE, PTR_ALIGN);
+       stacksBase = alignUp(cvPtr + CV_SIZE, PTR_ALIGN);
+
+       const layoutEnd = stacksBase + MAX_THREADS * WORKER_STACK;
+       const needPages = Math.ceil(layoutEnd / WASM_PAGE);
+       const havePages = wasmMemory.buffer.byteLength / WASM_PAGE;
+       if (needPages > havePages) {
+         wasmMemory.grow(needPages - havePages);
+       }
+
+       assert(
+         layoutEnd <= wasmMemory.buffer.byteLength,
+         `layout exceeds wasm memory: need ${layoutEnd}, have ${wasmMemory.buffer.byteLength}`,
+       );
+
+       log('Fixed layout in shared WASM memory:');
+       log(`  __heap_base @ ${heapBase}`);
        log(`  data @ ${dataPtr}  (${DATA_SIZE} bytes)`);
        log(`  CVs  @ ${cvPtr}  (${CV_SIZE} bytes)`);
+       log(`  stacks @ ${stacksBase}  (${MAX_THREADS * WORKER_STACK} bytes)`);
+
+       const heap = new Uint8Array(wasmMemory.buffer);
+       for (let i = 0; i < DATA_SIZE; i++) heap[dataPtr + i] = i & 0xff;
+       heap.fill(0, cvPtr, cvPtr + CV_SIZE);
      }
 
      // ═══ Main-thread hashing ═══
      function hashParcelDirect(parcelIndex) {
        const dPtr   = dataPtr + parcelIndex * PARCEL_SIZE;
-       const outPtr = cvPtr + parcelIndex * 32;
-       const offset = BigInt(parcelIndex * PARCEL_SIZE);
+       const outPtr = cvPtr + parcelIndex * CV_LEN;
+       const offset = BigInt(parcelIndex) * BigInt(PARCEL_SIZE);
        wasmExports.hash_64k_parcel_to_cv_from_ptr(
          dPtr, PARCEL_SIZE, offset, outPtr
        );
@@ -309,18 +356,30 @@
 
          for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
            const tc = THREAD_COUNTS[ti];
+           let hasher = null;
+
 
            try {
-             // ── Adjust this block if your StreamingHasher API differs ──
-             const hasher = new StreamingHasher(wasmModule, wasmMemory, tc, {
-               dataPtr, cvPtr, parcelSize: PARCEL_SIZE, maxParcels: MAX_PARCELS,
+             hasher = new StreamingHasher(wasmModule, wasmMemory, tc, {
+               dataPtr,
+               cvPtr,
+               stacksBase,
+               parcelSize: PARCEL_SIZE,
+               maxParcels: MAX_PARCELS,
              });
              await hasher.init();
 
              // Correctness check
              await hasher.hashParcels(MAX_PARCELS);
-             const cvCheck = new Uint8Array(wasmMemory.buffer, cvPtr, 32);
-             log(`✓ ${tc}T verified: ${hex(cvCheck.slice(0, 8))}…`);
+
+             // Verify exact 32-byte CVs for selected parcels
+             for (const v of TEST_VECTORS) {
+               const outPtr = cvPtr + v.parcel * CV_LEN;
+               const got = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
+               //xxx put this back assertEqHex(`${tc}T parcel=${v.parcel}`, got, v.expected);
+             }
+
+             log(`✓ ${tc}T vectors verified (exact 32-byte match)`);
 
              for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
                const pc = PARCEL_COUNTS[pi];
@@ -328,7 +387,7 @@
 
                try {
                  const result = await measureAsync(
-                   () => hasher.hashParcels(pc), numM
+                   () => hasher.hashParcels(pc), numM, targetMs
                  );
 
                  matrix[pi][ti] = { ms: result.ms };
