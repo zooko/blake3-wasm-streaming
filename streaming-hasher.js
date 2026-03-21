@@ -1,4 +1,3 @@
-const CV_LEN = 32;
 const WORKER_STACK = 65536;
 
 export class StreamingHasher {
@@ -6,7 +5,7 @@ export class StreamingHasher {
         wasmModule,
         memory,
         workerCount,
-        { dataPtr, cvPtr, stacksBase, parcelSize, maxParcels }
+        { dataPtr, cvPtr, parcelSize, maxParcels }
     ) {
         this.wasmModule = wasmModule;
         this.memory = memory;
@@ -14,7 +13,6 @@ export class StreamingHasher {
 
         this.dataPtr = dataPtr;
         this.cvPtr = cvPtr;
-        this.stacksBase = stacksBase;
         this.parcelSize = parcelSize;
         this.maxParcels = maxParcels;
 
@@ -91,9 +89,7 @@ export class StreamingHasher {
                         wasmModule: this.wasmModule,
                         memory: this.memory,
                         dataPtr: this.dataPtr,
-                        cvPtr: this.cvPtr,
-                        parcelSize: this.parcelSize,
-                        stackPtr: this.stacksBase + w * WORKER_STACK,
+                        cvPtr: this.cvPtr
                     });
 
                     this.workers.push(worker);

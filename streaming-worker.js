@@ -4,8 +4,7 @@ let hashFn = null;
 
 let dataPtrBase = 0;
 let cvPtrBase = 0;
-let parcelSize = 0;
-let stackPtr = 0;
+let PARCEL_SIZE = 128 * 1024;
 
 function assert(cond, msg) {
     if (!cond) throw new Error(msg);
@@ -22,37 +21,33 @@ self.onmessage = async (e) => {
 
             const ex = instance.exports;
 
+            //xxxassert(typeof msg.dataPtr === 'bigint')
             dataPtrBase = msg.dataPtr;
+            //xxxassert(typeof msg.cvPtr === 'bigint')
             cvPtrBase = msg.cvPtr;
-            parcelSize = msg.parcelSize;
-            stackPtr = msg.stackPtr;
 
-            hashFn = ex.hash_64k_parcel_to_cv_from_ptr;
-            assert(typeof hashFn === 'function', 'missing hash_64k_parcel_to_cv_from_ptr export');
+            hashFn = ex.hash_parcel_to_cv_from_ptr;
+            assert(typeof hashFn === 'function', 'missing hash_parcel_to_cv_from_ptr export');
 
             postMessage({ type: 'inited' });
             return;
         }
 
         if (msg.type === 'hash_range') {
+///xxx replace taskId with offset hashed
             const { taskId, startParcel, parcelCount } = msg;
 
-            let dataPtr = dataPtrBase + startParcel * parcelSize;
+            let dataPtr = dataPtrBase + startParcel * PARCEL_SIZE;
             let cvPtr = cvPtrBase + startParcel * CV_LEN;
-            let offset = BigInt(startParcel) * BigInt(parcelSize);
-            const offsetStep = BigInt(parcelSize);
 
             for (let i = 0; i < parcelCount; i++) {
                 hashFn(
                     dataPtr,
-                    parcelSize,
-                    offset,
                     cvPtr
                 );
 
-                dataPtr += parcelSize;
+                dataPtr += PARCEL_SIZE;
                 cvPtr += CV_LEN;
-                offset += offsetStep;
             }
 
             postMessage({ type: 'done', taskId });

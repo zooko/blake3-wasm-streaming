@@ -53,7 +53,7 @@
     <button id="btn-quick" onclick="window.runBenchmarks(true)">Quick Run (fewer measurements)</button>
     <div id="status"></div>
 
-    <h2>Main-Thread Benchmarks</h2>
+    <h2>Main-Thread Benchmarks — BLAKE3 vs WebCrypto SHA-256 (1T)</h2>
     <div id="main-results"></div>
 
     <h2>Streaming Worker Benchmarks (parcels × threads)</h2>
@@ -66,7 +66,7 @@
      import { StreamingHasher } from '../streaming-hasher.js';
 
      // ═══ Configuration ═══
-     const PARCEL_SIZE   = 256 * 1024;
+     const PARCEL_SIZE   = 128 * 1024;
      const MAX_PARCELS   = 512;
      const DATA_SIZE     = MAX_PARCELS * PARCEL_SIZE;
      const CV_LEN        = 32;
@@ -76,7 +76,7 @@
      const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
      const WORKER_STACK  = 65536;
-     const MAX_THREADS   = Math.max(...THREAD_COUNTS);
+     const MAX_THREADS   = 256;
      const PTR_ALIGN     = 16;
      const WASM_PAGE     = 65536;
 
@@ -181,6 +181,7 @@
      // ═══ WASM (main-thread instance) ═══
      let wasmModule, wasmExports, wasmMemory;
      let dataPtr, cvPtr, stacksBase;
+     let sha256Data;
 
      async function initWasm() {
        const resp  = await fetch(WASM_URL);
@@ -215,11 +216,6 @@
          wasmMemory.grow(needPages - havePages);
        }
 
-       assert(
-         layoutEnd <= wasmMemory.buffer.byteLength,
-         `layout exceeds wasm memory: need ${layoutEnd}, have ${wasmMemory.buffer.byteLength}`,
-       );
-
        log('Fixed layout in shared WASM memory:');
        log(`  __heap_base @ ${heapBase}`);
        log(`  data @ ${dataPtr}  (${DATA_SIZE} bytes)`);
@@ -228,16 +224,17 @@
 
        const heap = new Uint8Array(wasmMemory.buffer);
        for (let i = 0; i < DATA_SIZE; i++) heap[dataPtr + i] = i & 0xff;
-       heap.fill(0, cvPtr, cvPtr + CV_SIZE);
+       sha256Data = new Uint8Array(DATA_SIZE);
+       sha256Data.set(heap.subarray(dataPtr, dataPtr + DATA_SIZE));
      }
 
      // ═══ Main-thread hashing ═══
      function hashParcelDirect(parcelIndex) {
        const dPtr   = dataPtr + parcelIndex * PARCEL_SIZE;
        const outPtr = cvPtr + parcelIndex * CV_LEN;
-       const offset = BigInt(parcelIndex) * BigInt(PARCEL_SIZE);
-       wasmExports.hash_64k_parcel_to_cv_from_ptr(
-         dPtr, PARCEL_SIZE, offset, outPtr
+       const offset = parcelIndex * PARCEL_SIZE;
+       wasmExports.hash_parcel_to_cv_from_ptr(
+         dPtr, outPtr
        );
      }
 
@@ -253,19 +250,32 @@
        }
      }
 
-     // ═══ Table rendering ═══
      function renderMainTable(rows) {
        let html = `<table>
-         <tr><th>Parcels</th><th>Data</th><th>Poke (write SAB)</th>
-           <th>Direct Hash</th><th>Time/byte</th><th>Iters</th></tr>`;
+         <tr>
+           <th>Parcels</th>
+           <th>Data</th>
+           <th>Poke (write SAB)</th>
+           <th>BLAKE3 Direct</th>
+           <th>BLAKE3 Time/byte</th>
+           <th>SHA-256 (WebCrypto, 1T)</th>
+           <th>SHA-256 Time/byte</th>
+           <th>BLAKE3 vs SHA-256</th>
+           <th>Iters</th>
+         </tr>`;
        for (const r of rows) {
+         const b3vsSha = r.shaMs / r.directMs;
+         const cls = b3vsSha >= 1.05 ? 'good' : b3vsSha < 0.95 ? 'bad' : '';
          html += `<tr>
       <td>${r.parcels}</td>
       <td>${r.dataLabel}</td>
       <td>${fmtMs(r.pokeMs)}</td>
       <td>${fmtMs(r.directMs)}</td>
       <td><b>${fmtTimePerByte(r.directMs, r.bytes)}</b></td>
-      <td class="dim">${r.pokeIters} / ${r.hashIters}</td>
+      <td>${fmtMs(r.shaMs)}</td>
+      <td><b>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
+      <td><span class="${cls}">${b3vsSha.toFixed(2)}×</span></td>
+      <td class="dim">${r.pokeIters} / ${r.hashIters} / ${r.shaIters}</td>
     </tr>`;
        }
        html += '</table>';
@@ -331,23 +341,37 @@
            const bytes = pc * PARCEL_SIZE;
            const dataLabel = bytes >= 1048576 ? `${bytes / 1048576} MiB` : `${bytes / 1024} KiB`;
 
+           const shaView = sha256Data.subarray(0, bytes);
+
            const poke   = measureSync(() => pokeAll(pc), numM, targetMs);
            const direct = measureSync(() => hashAllDirect(pc), numM, targetMs);
+           const sha    = await measureAsync(
+             () => crypto.subtle.digest('SHA-256', shaView),
+             numM,
+             targetMs
+           );
 
            directBaseline.push(direct.ms);
            mainRows.push({
              parcels: pc, dataLabel, bytes,
              pokeMs: poke.ms, pokeIters: poke.iters,
              directMs: direct.ms, hashIters: direct.iters,
+             shaMs: sha.ms, shaIters: sha.iters,
            });
 
            const pad = String(pc).padStart(4);
-           log(`${pad}p  poke ${fmtMs(poke.ms).padStart(10)} (${poke.iters} iters)` +
-               `  direct ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)` +
-               `  ${fmtTimePerByte(direct.ms, bytes)}`);
+           const b3vsSha = sha.ms / direct.ms;
+           log(
+             `${pad}p  poke ${fmtMs(poke.ms).padStart(10)} (${poke.iters} iters)` +
+             `  b3 ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)` +
+             `  ${fmtTimePerByte(direct.ms, bytes)}` +
+             `  sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters} iters)` +
+             `  ${fmtTimePerByte(sha.ms, bytes)}` +
+             `  b3-vs-sha ${b3vsSha.toFixed(2)}×`
+           );
 
            renderMainTable(mainRows);
-           await sleep(10);
+           await sleep(1);
          }
 
          // ── Streaming benchmarks ──
@@ -363,7 +387,6 @@
              hasher = new StreamingHasher(wasmModule, wasmMemory, tc, {
                dataPtr,
                cvPtr,
-               stacksBase,
                parcelSize: PARCEL_SIZE,
                maxParcels: MAX_PARCELS,
              });
