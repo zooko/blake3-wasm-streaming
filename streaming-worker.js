@@ -1,4 +1,11 @@
+const CV_LEN = 32;
+
 let hashFn = null;
+
+let dataPtrBase = 0;
+let cvPtrBase = 0;
+let parcelSize = 0;
+let stackPtr = 0;
 
 function assert(cond, msg) {
     if (!cond) throw new Error(msg);
@@ -6,42 +13,56 @@ function assert(cond, msg) {
 
 self.onmessage = async (e) => {
     const msg = e.data;
+
     try {
         if (msg.type === 'init') {
-            const { wasmModule, memory, stackTop } = msg;
-
-            const instance = await WebAssembly.instantiate(wasmModule, {
-                env: { memory },
+            const instance = await WebAssembly.instantiate(msg.wasmModule, {
+                env: { memory: msg.memory },
             });
+
             const ex = instance.exports;
 
-            assert(
-                ex.__stack_pointer instanceof WebAssembly.Global,
-                'missing exported __stack_pointer',
-            );
-            assert((stackTop & 15) === 0, `stackTop not 16-byte aligned: ${stackTop}`);
-            ex.__stack_pointer.value = stackTop;
+            dataPtrBase = msg.dataPtr;
+            cvPtrBase = msg.cvPtr;
+            parcelSize = msg.parcelSize;
+            stackPtr = msg.stackPtr;
 
             hashFn = ex.hash_64k_parcel_to_cv_from_ptr;
             assert(typeof hashFn === 'function', 'missing hash_64k_parcel_to_cv_from_ptr export');
 
-            self.postMessage({ type: 'ready' });
+            postMessage({ type: 'inited' });
             return;
         }
 
-        assert(msg.type === 'hash', `unexpected message type: ${msg.type}`);
-        assert(hashFn !== null, 'worker used before init');
+        if (msg.type === 'hash_range') {
+            const { taskId, startParcel, parcelCount } = msg;
 
-        const { taskId, jobs } = msg;
-        for (const job of jobs) {
-            hashFn(job.dataPtr, job.size, job.offset, job.cvPtr);
+            let dataPtr = dataPtrBase + startParcel * parcelSize;
+            let cvPtr = cvPtrBase + startParcel * CV_LEN;
+            let offset = BigInt(startParcel) * BigInt(parcelSize);
+            const offsetStep = BigInt(parcelSize);
+
+            for (let i = 0; i < parcelCount; i++) {
+                hashFn(
+                    dataPtr,
+                    parcelSize,
+                    offset,
+                    cvPtr
+                );
+
+                dataPtr += parcelSize;
+                cvPtr += CV_LEN;
+                offset += offsetStep;
+            }
+
+            postMessage({ type: 'done', taskId });
+            return;
         }
-        self.postMessage({ type: 'done', taskId });
     } catch (err) {
-        self.postMessage({
+        postMessage({
             type: 'error',
             taskId: msg.taskId,
-            error: String(err),
+            error: String(err?.stack || err),
         });
     }
 };

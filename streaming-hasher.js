@@ -1,166 +1,152 @@
 const CV_LEN = 32;
 const WORKER_STACK = 65536;
-const STACK_ALIGN = 16;
-
-function assert(cond, msg) {
-    if (!cond) throw new Error(msg);
-}
 
 export class StreamingHasher {
     constructor(
         wasmModule,
         memory,
         workerCount,
-        { dataPtr, cvPtr, stacksBase, parcelSize, maxParcels },
+        { dataPtr, cvPtr, stacksBase, parcelSize, maxParcels }
     ) {
-        this.workers = [];
-        this.memory = memory;
         this.wasmModule = wasmModule;
-        this.pendingTasks = new Map();
-        this.nextTaskId = 0;
-        this.inflightPerWorker = [];
+        this.memory = memory;
         this.workerCount = workerCount;
+
         this.dataPtr = dataPtr;
         this.cvPtr = cvPtr;
         this.stacksBase = stacksBase;
         this.parcelSize = parcelSize;
         this.maxParcels = maxParcels;
-    }
-
-    async init() {
-        await this.spawnWorkers(this.workerCount);
-    }
-
-    async spawnWorkers(count) {
-        assert(this.workers.length === 0, 'spawnWorkers called more than once');
-        assert(this.inflightPerWorker.length === 0,
-            'spawnWorkers called after inflight state was created');
-       assert(this.pendingTasks.size === 0,
-            'spawnWorkers called with pending tasks still present');
 
         this.workers = [];
+        this.pendingTasks = new Map();
+        this.nextTaskId = 1;
 
-        assert(Number.isInteger(count), `spawnWorkers: bad count ${count}`);
-        assert(count > 0, `spawnWorkers: count must be > 0, got ${count}`);
-        assert(this.stacksBase !== undefined, 'spawnWorkers: missing stacksBase');
-        assert(this.workerCount <= 0 || count <= this.workerCount, 'spawnWorkers: bad count');
-        assert(this.stacksBase % STACK_ALIGN === 0, `stacksBase not ${STACK_ALIGN}-byte aligned`);
-
-        const readyPromises = [];
-        for (let i = 0; i < count; i++) {
-            const w = new Worker(
-                new URL('./streaming-worker.js', import.meta.url),
-                { type: 'module' },
-            );
-
-            readyPromises.push(new Promise((resolve, reject) => {
-                const timeout = setTimeout(
-                    () => reject(new Error(`Worker ${i} init timeout`)), 10000,
-                );
-                w.onerror = (evt) => {
-                    clearTimeout(timeout);
-                    reject(new Error(`Worker ${i} failed: ${evt.message || 'unknown'}`));
-                };
-                w.onmessage = (e) => {
-                    clearTimeout(timeout);
-                    if (e.data.type === 'ready') resolve();
-                    else if (e.data.type === 'error') reject(new Error(e.data.error));
-                };
-            }));
-
-            const stackTop = this.stacksBase + (i + 1) * WORKER_STACK;
-            assert(stackTop % STACK_ALIGN === 0, `stackTop not ${STACK_ALIGN}-byte aligned`);
-            w.postMessage({
-                type: 'init',
-                wasmModule: this.wasmModule,
-                memory: this.memory,
-                stackTop,
-            });
-
-            this.workers.push(w);
-            this.inflightPerWorker.push(0);
-        }
-
-        await Promise.all(readyPromises);
-
-        for (const w of this.workers) {
-            w.onmessage = (e) => this.#handleResult(e.data);
-        }
+        this._initPromise = null;
+        this._initialized = false;
     }
 
-    #handleResult(data) {
-        const task = this.pendingTasks.get(data.taskId);
-        if (!task) return;
-        this.pendingTasks.delete(data.taskId);
-        this.inflightPerWorker[task.workerIdx]--;
-        if (data.type === 'done') task.resolve();
-        else task.reject(new Error(data.error));
-    }
+    init() {
+        if (this._initialized) return Promise.resolve();
+        if (this._initPromise) return this._initPromise;
 
-    #leastLoadedWorker() {
-        let minIdx = 0;
-        for (let i = 1; i < this.workers.length; i++) {
-            if (this.inflightPerWorker[i] < this.inflightPerWorker[minIdx]) minIdx = i;
-        }
-        return minIdx;
-    }
+        this._initPromise = Promise.all(
+            Array.from({ length: this.workerCount }, (_, w) => {
+                return new Promise((resolve, reject) => {
+                    const worker = new Worker(new URL('./streaming-worker.js', import.meta.url), { type: 'module' });
+                    worker.onerror = (event) => {
+                        reject(
+                            new Error(
+                                `Worker init failed: ${event.message || 'unknown'}`
+                                    + (event.filename ? ` at ${event.filename}` : '')
+                                    + (event.lineno ? `:${event.lineno}` : '')
+                                    + (event.colno ? `:${event.colno}` : '')
+                            )
+                        );
+                    };
 
-    #dispatch(jobs, workerIdx) {
-        // xxx re-add the feature of dispatching to the least loaded worker. But do not make `workerIdx` optional! Either remove `workerIdx` so that the only way to call this function is without specifying the nn
+                    worker.onmessageerror = () => {
+                        reject(new Error('Worker message deserialization failed'));
+                    };
 
-        assert(workerIdx >= 0 && workerIdx < this.workers.length, `bad workerIdx ${workerIdx}`);
+                    worker.onmessage = (e) => {
+                        const msg = e.data;
 
-        const taskId = this.nextTaskId++;
-        this.inflightPerWorker[workerIdx]++;
+                        if (msg.type === 'inited') {
+                            resolve();
+                            return;
+                        }
 
-        const promise = new Promise((resolve, reject) => {
-            this.pendingTasks.set(taskId, { resolve, reject, workerIdx });
+                        if (msg.type === 'done') {
+                            const pending = this.pendingTasks.get(msg.taskId);
+                            if (!pending) return;
+
+                            pending.remaining--;
+                            if (pending.remaining === 0) {
+                                this.pendingTasks.delete(msg.taskId);
+                                pending.resolve();
+                            }
+                            return;
+                        }
+
+                        if (msg.type === 'error') {
+                            if (msg.taskId != null) {
+                                const pending = this.pendingTasks.get(msg.taskId);
+                                if (pending) {
+                                    this.pendingTasks.delete(msg.taskId);
+                                    pending.reject(new Error(msg.error || 'worker error'));
+                                    return;
+                                }
+                            }
+                            reject(new Error(msg.error || 'worker init error'));
+                        }
+                    };
+
+                    worker.onerror = (err) => {
+                        reject(err);
+                    };
+
+                    worker.postMessage({
+                        type: 'init',
+                        wasmModule: this.wasmModule,
+                        memory: this.memory,
+                        dataPtr: this.dataPtr,
+                        cvPtr: this.cvPtr,
+                        parcelSize: this.parcelSize,
+                        stackPtr: this.stacksBase + w * WORKER_STACK,
+                    });
+
+                    this.workers.push(worker);
+                });
+            })
+        ).then(() => {
+            this._initialized = true;
         });
 
-        this.workers[workerIdx].postMessage({ type: 'hash', taskId, jobs });
-        return promise;
+        return this._initPromise;
     }
 
-    //xxx we need to pass the starting offset
     hashParcels(numParcels) {
-        assert(Number.isInteger(numParcels), `hashParcels: numParcels must be int, got ${numParcels}`);
-        assert(
-            numParcels >= 0 && numParcels <= this.maxParcels,
-            `hashParcels: numParcels=${numParcels} out of range 0..${this.maxParcels}`,
-        );
-        assert(this.workers.length > 0, 'hashParcels: no workers');
-
-        if (!Number.isInteger(numParcels)) {
-            throw new Error(`hashParcels: numParcels must be int, got ${numParcels}`);
+        if (!this._initialized) {
+            return Promise.reject(new Error('StreamingHasher not initialized'));
         }
-        if (numParcels < 0 || numParcels > this.maxParcels) {
-            throw new Error(
-                `hashParcels: numParcels=${numParcels} out of range 0..${this.maxParcels}`,
-            );
-        }
-        if (this.workers.length === 0) {
-            throw new Error('hashParcels: no workers');
+        if (numParcels === 0) return Promise.resolve();
+        if (numParcels > this.maxParcels) {
+            return Promise.reject(new Error(`too many parcels: ${numParcels}`));
         }
 
-        const jobsPerWorker = Array.from(
-            { length: this.workers.length },
-            () => [],
-        );
+        const activeWorkers = Math.min(this.workers.length, numParcels);
+        const taskId = this.nextTaskId++;
 
-        for (let i = 0; i < numParcels; i++) {
-            jobsPerWorker[i % this.workers.length].push({
-                dataPtr: this.dataPtr + i * this.parcelSize,
-                size: this.parcelSize,
-                offset: BigInt(i) * BigInt(this.parcelSize),
-                cvPtr: this.cvPtr + i * CV_LEN,
+        let resolve, reject;
+        const promise = new Promise((res, rej) => {
+            resolve = res;
+            reject = rej;
+        });
+
+        this.pendingTasks.set(taskId, {
+            remaining: activeWorkers,
+            resolve,
+            reject,
+        });
+
+        const base = (numParcels / activeWorkers) | 0;
+        const extra = numParcels % activeWorkers;
+
+        let startParcel = 0;
+        for (let w = 0; w < activeWorkers; w++) {
+            const parcelCount = base + (w < extra ? 1 : 0);
+
+            this.workers[w].postMessage({
+                type: 'hash_range',
+                taskId,
+                startParcel,
+                parcelCount,
             });
+
+            startParcel += parcelCount;
         }
-        const promises = [];
-        for (let w = 0; w < this.workers.length; w++) {
-            if (jobsPerWorker[w].length > 0) {
-                promises.push(this.#dispatch(jobsPerWorker[w], w));
-            }
-        }
-        return Promise.all(promises);
+
+        return promise;
     }
 }
