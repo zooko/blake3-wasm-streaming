@@ -1,0 +1,20 @@
+[req]
+prompt = no
+default_bits = 2048
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3
+
+[dn]
+CN = Donalds-MacBook-Pro.local
+
+[v3]
+subjectAltName = @alt_names
+extendedKeyUsage = serverAuth
+keyUsage = critical, digitalSignature, keyEncipherment, keyCertSign, cRLSign
+basicConstraints = critical, CA:true
+
+[alt_names]
+DNS.1 = Donalds-MacBook-Pro.local
+DNS.2 = localhost
+IP.1 = 127.0.0.1

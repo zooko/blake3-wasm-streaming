@@ -1,6 +1,6 @@
 use core::{ptr, slice};
 
-const PARCEL_SIZE: usize = 256 * 1024;
+const PARCEL_SIZE: usize = 16 * 1024;
 const CV_SIZE: usize = 32;
 
 // ── Single-parcel hashing ───────────────────────────────────

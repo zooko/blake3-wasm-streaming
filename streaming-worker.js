@@ -4,7 +4,7 @@ let hashFn = null;
 
 let dataPtrBase = 0;
 let cvPtrBase = 0;
-let PARCEL_SIZE = 128 * 1024;
+let PARCEL_SIZE = 16 * 1024;
 
 function assert(cond, msg) {
     if (!cond) throw new Error(msg);
