@@ -62,6 +62,7 @@
 
     <pre id="log"></pre>
 
+    <script src="coi-serviceworker.min.js"></script>
     <script type="module">
      import { StreamingHasher } from '../streaming-hasher.js';
 
@@ -72,7 +73,7 @@
      const CV_LEN        = 32;
      const CV_SIZE       = MAX_PARCELS * CV_LEN;
      const PARCEL_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
-     const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8, 16, 20, 24, 32];
+     const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8];
      const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
      const WORKER_STACK  = 65536;
