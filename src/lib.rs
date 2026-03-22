@@ -57,7 +57,6 @@ fn hash_parcels_to_cvs(input: &[u8], out: &mut [u8]) -> usize {
             inp = inp.add(PARCEL_SIZE);
             outp = outp.add(CV_SIZE);
         }
-        inp = unsafe { inp.add(PARCEL_SIZE) };
     }
     num_parcels
 }
