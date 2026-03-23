@@ -94,6 +94,23 @@
      const MEAS_FULL     = 9;
      const MEAS_QUICK    = 5;
 
+     // ═══ Test Vectors ═══
+     // BLAKE3 hash of the repeating byte pattern [0, 1, 2, …, 255, 0, 1, …]
+     // truncated to the given length.
+     // Set expected to null → logs computed hex so you can paste it back.
+     const TEST_VECTORS = [
+       { bytes: 16 * 1024,       expected: 'd49d367e4b0011a34510a28a1eb0caeb3e51e77ff2d30136849454640fefefc1' },
+       { bytes: 256 * 1024,      expected: 'b7db553d6c87096cf988bc6550f37b3f5d5f95537dd18ece86c047f97e786282' },
+       { bytes: 1024 * 1024,     expected: '64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533' },
+       { bytes: 8 * 1024 * 1024, expected: '16b79b891510f1f584266448c9ca6f229d81265a9d2801074c2098e46a3d2383' },
+     ];
+
+     // Must match multithreading-hasher.js
+     const MT_MIN_BLOCK = 1 << 17;
+     function floorPow2(n) {
+       return n < 1 ? 0 : 1 << (31 - Math.clz32(n));
+     }
+
      // ═══ DOM ═══
      const logEl    = document.getElementById('log');
      const statusEl = document.getElementById('status');
@@ -227,6 +244,86 @@
        sha256Data.set(heap.subarray(dataPtr, dataPtr + MAX_DATA));
      }
 
+     // ═══ Verification (runs outside all benchmark timing) ═══
+
+     function verifyTestVectors() {
+       log('');
+       log('── BLAKE3 test vector verification ──');
+       let allPassed = true;
+       let anyNull = false;
+       for (const v of TEST_VECTORS) {
+         assert(v.bytes <= MAX_DATA, `test size ${fmtSize(v.bytes)} exceeds MAX_DATA`);
+         wasmExports.blake3_hash(dataPtr, v.bytes, outPtr);
+         const got = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
+         if (v.expected === null) {
+           log(`  ${fmtSize(v.bytes).padStart(8)}  ${got}  ← paste as expected`);
+           anyNull = true;
+         } else if (got === v.expected) {
+           log(`  ${fmtSize(v.bytes).padStart(8)}  ✓`);
+         } else {
+           log(`  ${fmtSize(v.bytes).padStart(8)}  ✗ MISMATCH`);
+           log(`    expected: ${v.expected}`);
+           log(`    got:      ${got}`);
+           allPassed = false;
+         }
+       }
+       if (!allPassed) throw new Error('BLAKE3 test vector mismatch — see log');
+       if (anyNull) log('  (paste logged hex values into TEST_VECTORS to enable assertions)');
+       else log('  All test vectors passed ✓');
+     }
+
+     async function verifyMtCorrectness(hasher, numWorkers) {
+       const len = MAX_DATA;
+       await hasher.hashRegion(len);
+
+       // Replicate chunk-splitting logic from MultithreadingHasher.hashRegion
+       let chunk = floorPow2(Math.floor(len / numWorkers));
+       let active;
+       if (chunk >= MT_MIN_BLOCK) {
+         active = numWorkers;
+       } else {
+         chunk = MT_MIN_BLOCK;
+         active = Math.floor(len / MT_MIN_BLOCK);
+       }
+
+       if (active < 2) {
+         // Single-threaded fallback — one hash at outPtr
+         const mtHash = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
+         wasmExports.blake3_hash(dataPtr, len, outPtr);
+         const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
+         assert(mtHash === ref, `${numWorkers}T single-thread fallback mismatch`);
+         log(`✓ ${numWorkers}T verified (single-thread fallback)`);
+         return;
+       }
+
+       // Save MT outputs before we overwrite outPtr
+       const hasTail = (active * chunk) < len;
+       const numOutputs = active + (hasTail ? 1 : 0);
+       const saved = new Uint8Array(numOutputs * CV_LEN);
+       saved.set(new Uint8Array(wasmMemory.buffer, outPtr, numOutputs * CV_LEN));
+
+       // Re-hash each worker's chunk on the main thread and compare
+       for (let i = 0; i < active; i++) {
+         wasmExports.blake3_hash(dataPtr + i * chunk, chunk, outPtr);
+         const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
+         const got = hex(saved.subarray(i * CV_LEN, (i + 1) * CV_LEN));
+         assert(ref === got,
+           `${numWorkers}T chunk[${i}] mismatch\n  expected: ${ref}\n  got:      ${got}`);
+       }
+
+       // Verify tail (hashed by main thread inside hashRegion)
+       if (hasTail) {
+         const dispatched = active * chunk;
+         wasmExports.blake3_hash(dataPtr + dispatched, len - dispatched, outPtr);
+         const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
+         const got = hex(saved.subarray(active * CV_LEN, (active + 1) * CV_LEN));
+         assert(ref === got,
+           `${numWorkers}T tail mismatch\n  expected: ${ref}\n  got:      ${got}`);
+       }
+
+       log(`✓ ${numWorkers}T verified (${active} chunks${hasTail ? ' + tail' : ''})`);
+     }
+
      // ═══ Main-thread hashing ═══
      function hashBlake3(bytes) {
        wasmExports.blake3_hash(dataPtr, bytes, outPtr);
@@ -324,7 +421,11 @@
          setStatus('Loading WASM…');
          await initWasm();
 
-         log('── From here on: ZERO calls to alloc ──');
+         // ── Correctness verification (outside all timing) ──
+         verifyTestVectors();
+
+         log('');
+         log('── Benchmarks (zero-allocation from here) ──');
          setStatus('Running main-thread benchmarks…');
          await sleep(50);
 
@@ -386,8 +487,8 @@
              );
              await hasher.init();
 
-             await hasher.hashRegion(MAX_DATA);
-             log(`✓ ${tc}T initialized`);
+             // ── MT correctness verification (outside timing) ──
+             await verifyMtCorrectness(hasher, tc);
 
              for (let si = 0; si < DATA_SIZES.length; si++) {
                const bytes = DATA_SIZES[si];
