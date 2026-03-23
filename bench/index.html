@@ -45,7 +45,7 @@
   <body>
 
     <h1>BLAKE3 WASM — Zero-Allocation Benchmarks</h1>
-    <p>Pre-allocates data + CV regions in shared WASM memory once.<br>
+    <p>Pre-allocates data + output regions in shared WASM memory once.<br>
       All benchmark iterations use pointer arithmetic only — zero calls to alloc.</p>
     <p>Cores: <span id="cores"></span></p>
 
@@ -57,8 +57,8 @@
     <div id="main-results"></div>
 
     <h2>Multithreading Worker Benchmarks (data size × threads)</h2>
-    <p style="color:#aaa; font-size:13px;">Each cell: time/byte · speedup vs single-threaded direct</p>
-    <div id="streaming-results"></div>
+    <p style="color:#aaa; font-size:13px;">Each cell: time/byte · speedup vs single-threaded BLAKE3</p>
+    <div id="mt-results"></div>
 
     <pre id="log"></pre>
 
@@ -67,12 +67,22 @@
      import { MultithreadingHasher } from '../multithreading-hasher.js';
 
      // ═══ Configuration ═══
-     const PARCEL_SIZE   = 16 * 1024;
-     const MAX_PARCELS   = 512;
-     const DATA_SIZE     = MAX_PARCELS * PARCEL_SIZE;
+     const DATA_SIZES = [
+       16 * 1024,          //   16 KiB
+       32 * 1024,          //   32 KiB
+       64 * 1024,          //   64 KiB
+       128 * 1024,         //  128 KiB
+       256 * 1024,         //  256 KiB
+       512 * 1024,         //  512 KiB
+       1024 * 1024,        //    1 MiB
+       2 * 1024 * 1024,    //    2 MiB
+       4 * 1024 * 1024,    //    4 MiB
+       8 * 1024 * 1024,    //    8 MiB
+     ];
+     const MAX_DATA      = DATA_SIZES[DATA_SIZES.length - 1];
      const CV_LEN        = 32;
-     const CV_SIZE       = MAX_PARCELS * CV_LEN;
-     const PARCEL_COUNTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+     const MAX_OUTPUTS   = 256;
+     const OUTPUT_REGION = MAX_OUTPUTS * CV_LEN;
      const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8];
      const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
@@ -81,9 +91,7 @@
      const PTR_ALIGN     = 16;
      const WASM_PAGE     = 65536;
 
-     // Each measurement block targets ≥200 ms wall-clock so timer
-     // quantization (possibly as coarse as 100 µs) is negligible.
-     const MEAS_FULL     = 9;   // measurements per data point (take median)
+     const MEAS_FULL     = 9;
      const MEAS_QUICK    = 5;
 
      // ═══ DOM ═══
@@ -102,24 +110,12 @@
      function alignUp(x, align) {
        return Math.ceil(x / align) * align;
      }
-     
-     // Hard-coded known-good vectors (full 32-byte CV hex).
-     const TEST_VECTORS = [
-       { parcel: 0,   expected: 'e0e5b812c75bbf82f2bd640467c09172c2bdba11a084239d3b735cca87ad091b' },
-       { parcel: 1,   expected: 'c0dd7ecdbab86ff239d661e06cd9917e9257e22f5fefd2fac4efe77138c93ad0' },
-       { parcel: 127, expected: 'eff4c05f399226f9d7829a746a07b2f8e93c84f2851292ad87ee2207538435f6' },
-     ];
-     function hex(buf) {
-       return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
-     }
-     function assertEqHex(label, actual, expected) {
-       if (actual !== expected) {
-         throw new Error(
-           `${label} mismatch\nexpected: ${expected}\nactual:   ${actual}`,
-         );
-       }
-     }
 
+     function fmtSize(bytes) {
+       if (bytes >= 1048576) return `${bytes / 1048576} MiB`;
+       if (bytes >= 1024) return `${bytes / 1024} KiB`;
+       return `${bytes} B`;
+     }
      function fmtMs(ms) {
        if (ms >= 1)     return ms.toFixed(3) + ' ms';
        if (ms >= 0.001) return (ms * 1000).toFixed(1) + ' µs';
@@ -131,17 +127,18 @@
        if (nsB >= 1)    return nsB.toFixed(2) + ' ns/B';
        return (nsB * 1000).toFixed(0) + ' ps/B';
      }
+     function hex(buf) {
+       return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+     }
 
      // ═══ Calibrated measurement ═══
-     // Finds iteration count so the timed block takes ≥ targetMs.
      function calibrateSync(fn, targetMs) {
-       fn(); fn(); fn();                     // warm up
+       fn(); fn(); fn();
        const probe = 5;
        const t0 = performance.now();
        for (let i = 0; i < probe; i++) fn();
        const elapsed = performance.now() - t0;
        const perIter = elapsed / probe;
-       // If a single call is below timer resolution, assume 20 µs worst-case
        if (perIter < 0.001) return Math.ceil(targetMs / 0.020);
        return Math.max(3, Math.ceil(targetMs / perIter));
      }
@@ -159,7 +156,7 @@
      }
 
      async function calibrateAsync(fn, targetMs) {
-       await fn(); await fn(); await fn();   // warm up
+       await fn(); await fn(); await fn();
        const t0 = performance.now();
        await fn();
        const elapsed = performance.now() - t0;
@@ -181,9 +178,8 @@
 
      // ═══ WASM (main-thread instance) ═══
      let wasmModule, wasmExports, wasmMemory;
-     let dataPtr, cvPtr, stacksBase;
+     let dataPtr, outPtr, stacksBase;
      let sha256Data;
-     let stagingView;
 
      async function initWasm() {
        const resp  = await fetch(WASM_URL);
@@ -207,9 +203,9 @@
        );
 
        const heapBase = wasmExports.__heap_base.value;
-       dataPtr = alignUp(heapBase, PTR_ALIGN);
-       cvPtr = alignUp(dataPtr + DATA_SIZE, PTR_ALIGN);
-       stacksBase = alignUp(cvPtr + CV_SIZE, PTR_ALIGN);
+       dataPtr    = alignUp(heapBase, PTR_ALIGN);
+       outPtr     = alignUp(dataPtr + MAX_DATA, PTR_ALIGN);
+       stacksBase = alignUp(outPtr + OUTPUT_REGION, PTR_ALIGN);
 
        const layoutEnd = stacksBase + MAX_THREADS * WORKER_STACK;
        const needPages = Math.ceil(layoutEnd / WASM_PAGE);
@@ -220,114 +216,88 @@
 
        log('Fixed layout in shared WASM memory:');
        log(`  __heap_base @ ${heapBase}`);
-       log(`  data @ ${dataPtr}  (${DATA_SIZE} bytes)`);
-       log(`  CVs  @ ${cvPtr}  (${CV_SIZE} bytes)`);
-       log(`  stacks @ ${stacksBase}  (${MAX_THREADS * WORKER_STACK} bytes)`);
+       log(`  data    @ ${dataPtr}  (${MAX_DATA} bytes)`);
+       log(`  output  @ ${outPtr}  (${OUTPUT_REGION} bytes)`);
+       log(`  stacks  @ ${stacksBase}  (${MAX_THREADS * WORKER_STACK} bytes)`);
 
-       sha256Data = new Uint8Array(DATA_SIZE);
-       for (let i = 0; i < DATA_SIZE; i++) sha256Data[i] = i & 0xff;
+       const heap = new Uint8Array(wasmMemory.buffer);
+       for (let i = 0; i < MAX_DATA; i++) heap[dataPtr + i] = i & 0xff;
+
+       sha256Data = new Uint8Array(MAX_DATA);
+       sha256Data.set(heap.subarray(dataPtr, dataPtr + MAX_DATA));
      }
 
      // ═══ Main-thread hashing ═══
-     function hashParcelDirect(parcelIndex) {
-       const dPtr   = dataPtr + parcelIndex * PARCEL_SIZE;
-       const outPtr = cvPtr + parcelIndex * CV_LEN;
-       const offset = parcelIndex * PARCEL_SIZE;
-       wasmExports.hash_parcel_to_cv_from_ptr(
-         dPtr, outPtr
-       );
+     function hashBlake3(bytes) {
+       wasmExports.blake3_hash(dataPtr, bytes, outPtr);
      }
 
-     function hashAllDirect(count) {
-       for (let i = 0; i < count; i++) hashParcelDirect(i);
-     }
-
-     function hashBulk(bytes) {
-       wasmExports.blake3_hash(dataPtr, bytes, cvPtr);
-     }
-
-     function populateBufferDirect(count) {
+     function populateBufferDirect(bytes) {
        const heap = new Uint8Array(wasmMemory.buffer);
-       for (let p = 0; p < count; p++) {
-         const base = dataPtr + p * PARCEL_SIZE;
-         for (let i = 0; i < PARCEL_SIZE; i++) heap[base + i] = i & 0xff;
-       }
+       for (let i = 0; i < bytes; i++) heap[dataPtr + i] = i & 0xff;
      }
 
-     function populateViaStaging(count) {
-       const bytes = count * PARCEL_SIZE;
+     function populateViaStaging(bytes) {
        for (let i = 0; i < bytes; i++) sha256Data[i] = i & 0xff;
        new Uint8Array(wasmMemory.buffer, dataPtr, bytes).set(sha256Data.subarray(0, bytes));
      }
 
-     function populateBulkOnly(count) {
-       const bytes = count * PARCEL_SIZE;
+     function populateBulkOnly(bytes) {
        new Uint8Array(wasmMemory.buffer, dataPtr, bytes).set(sha256Data.subarray(0, bytes));
      }
 
      function renderMainTable(rows) {
        let html = `<table>
          <tr>
-           <th>Parcels</th>
-           <th>Data</th>
+           <th>Data Size</th>
            <th>popBuf (write SAB)</th>
            <th>popAB+copy (AB→SAB)</th>
            <th>popSet (→SAB)</th>
-           <th>BLAKE3 Direct</th>
+           <th>BLAKE3 (1T)</th>
            <th>BLAKE3 Time/byte</th>
-           <th>BLAKE3 Bulk</th>
-           <th>Bulk Time/byte</th>
-           <th>SHA-256 (WebCrypto, 1T)</th>
+           <th>SHA-256 (WebCrypto)</th>
            <th>SHA-256 Time/byte</th>
            <th>BLAKE3 vs SHA-256</th>
            <th>Iters</th>
          </tr>`;
        for (const r of rows) {
-         const b3vsSha = r.shaMs / r.directMs;
-         const cls = b3vsSha >= 1.05 ? 'good' : b3vsSha < 0.95 ? 'bad' : '';
-         const bulkVsSha = r.shaMs / r.bulkMs;
-         const clsBulk = bulkVsSha >= 1.05 ? 'good' : bulkVsSha < 0.95 ? 'bad' : '';
+         const ratio = r.shaMs / r.b3Ms;
+         const cls = ratio >= 1.05 ? 'good' : ratio < 0.95 ? 'bad' : '';
          html += `<tr>
-      <td>${r.parcels}</td>
-      <td>${r.dataLabel}</td>
+      <td>${r.sizeLabel}</td>
       <td>${fmtMs(r.popBufMs)}</td>
       <td>${fmtMs(r.popABMs)}</td>
       <td>${fmtMs(r.popSetMs)}</td>
-      <td>${fmtMs(r.directMs)}</td>
-      <td><b>${fmtTimePerByte(r.directMs, r.bytes)}</b></td>
-      <td>${fmtMs(r.bulkMs)}</td>
-      <td><b>${fmtTimePerByte(r.bulkMs, r.bytes)}</b></td>
+      <td>${fmtMs(r.b3Ms)}</td>
+      <td><b>${fmtTimePerByte(r.b3Ms, r.bytes)}</b></td>
       <td>${fmtMs(r.shaMs)}</td>
       <td><b>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
-      <td><span class="${cls}">${b3vsSha.toFixed(2)}×</span> / <span class="${clsBulk}">${bulkVsSha.toFixed(2)}×</span></td>
-      <td class="dim">${r.popBufIters} / ${r.popABIters} / ${r.popSetIters} / ${r.hashIters} / ${r.shaIters}</td>
+      <td><span class="${cls}">${ratio.toFixed(2)}×</span></td>
+      <td class="dim">${r.popBufIters} / ${r.popABIters} / ${r.popSetIters} / ${r.b3Iters} / ${r.shaIters}</td>
     </tr>`;
        }
        html += '</table>';
        document.getElementById('main-results').innerHTML = html;
      }
 
-     function renderStreamingTable(matrix, directBaseline) {
-       let html = '<table><tr><th>Parcels╲Threads</th>';
+     function renderMtTable(matrix, baseline) {
+       let html = '<table><tr><th>Size╲Threads</th>';
        for (const t of THREAD_COUNTS) html += `<th>${t}T</th>`;
        html += '</tr>';
 
-       for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
-         const pc = PARCEL_COUNTS[pi];
-         const bytes = pc * PARCEL_SIZE;
-         const kib = bytes / 1024;
-         const label = kib >= 1024 ? `${pc}p (${kib/1024} MiB)` : `${pc}p (${kib} KiB)`;
-         html += `<tr><td>${label}</td>`;
+       for (let si = 0; si < DATA_SIZES.length; si++) {
+         const bytes = DATA_SIZES[si];
+         html += `<tr><td>${fmtSize(bytes)}</td>`;
 
          for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
-           const cell = matrix[pi]?.[ti];
+           const cell = matrix[si]?.[ti];
            if (!cell) {
              html += '<td>—</td>';
            } else if (cell.err) {
              html += `<td class="err" title="${cell.err}">❌</td>`;
            } else {
              const tpb = fmtTimePerByte(cell.ms, bytes);
-             const speedup = directBaseline[pi] / cell.ms;
+             const speedup = baseline[si] / cell.ms;
              const cls = speedup >= 1.05 ? 'good' : speedup < 0.95 ? 'bad' : '';
              html += `<td>${tpb}<br><span class="dim ${cls}">${speedup.toFixed(2)}×</span></td>`;
            }
@@ -335,18 +305,18 @@
          html += '</tr>';
        }
        html += '</table>';
-       document.getElementById('streaming-results').innerHTML = html;
+       document.getElementById('mt-results').innerHTML = html;
      }
 
      // ═══ Main benchmark runner ═══
      async function runBenchmarks(quick = false) {
-       const btnRun  = document.getElementById('btn-run');
+       const btnRun   = document.getElementById('btn-run');
        const btnQuick = document.getElementById('btn-quick');
        const targetMs = quick ? 40 : 200;
        btnRun.disabled = btnQuick.disabled = true;
        logEl.textContent = '';
        document.getElementById('main-results').innerHTML = '';
-       document.getElementById('streaming-results').innerHTML = '';
+       document.getElementById('mt-results').innerHTML = '';
 
        const numM = quick ? MEAS_QUICK : MEAS_FULL;
 
@@ -360,107 +330,91 @@
 
          // ── Main-thread benchmarks ──
          const mainRows = [];
-         const directBaseline = [];
+         const baseline = [];
 
-         for (const pc of PARCEL_COUNTS) {
-           const bytes = pc * PARCEL_SIZE;
-           const dataLabel = bytes >= 1048576 ? `${bytes / 1048576} MiB` : `${bytes / 1024} KiB`;
+         for (const bytes of DATA_SIZES) {
+           const sizeLabel = fmtSize(bytes);
+           const shaView   = sha256Data.subarray(0, bytes);
 
-           const shaView = sha256Data.subarray(0, bytes);
-
-           const popBuf   = measureSync(() => populateBufferDirect(pc), numM, targetMs);
-           const popAB    = measureSync(() => populateViaStaging(pc), numM, targetMs);
-           const popSet   = measureSync(() => populateBulkOnly(pc), numM, targetMs);
-           const direct = measureSync(() => hashAllDirect(pc), numM, targetMs);
-           const bulk = measureSync(() => hashBulk(bytes), numM, targetMs);
+           const popBuf = measureSync(() => populateBufferDirect(bytes), numM, targetMs);
+           const popAB  = measureSync(() => populateViaStaging(bytes),   numM, targetMs);
+           const popSet = measureSync(() => populateBulkOnly(bytes),     numM, targetMs);
+           const b3     = measureSync(() => hashBlake3(bytes),           numM, targetMs);
            const sha    = await measureAsync(
-             () => crypto.subtle.digest('SHA-256', shaView),
-             numM,
-             targetMs
+             () => crypto.subtle.digest('SHA-256', shaView), numM, targetMs
            );
 
-           directBaseline.push(direct.ms);
+           baseline.push(b3.ms);
            mainRows.push({
-             parcels: pc, dataLabel, bytes,
+             sizeLabel, bytes,
              popBufMs: popBuf.ms, popBufIters: popBuf.iters,
-             popABMs: popAB.ms, popABIters: popAB.iters,
+             popABMs:  popAB.ms,  popABIters:  popAB.iters,
              popSetMs: popSet.ms, popSetIters: popSet.iters,
-             directMs: direct.ms, hashIters: direct.iters,
-             bulkMs: bulk.ms, bulkIters: bulk.iters,
-             shaMs: sha.ms, shaIters: sha.iters,
+             b3Ms:     b3.ms,     b3Iters:     b3.iters,
+             shaMs:    sha.ms,    shaIters:    sha.iters,
            });
 
-           const pad = String(pc).padStart(4);
-           const b3vsSha = sha.ms / direct.ms;
+           const ratio = sha.ms / b3.ms;
            log(
-             `${pad}p  popBuf ${fmtMs(popBuf.ms).padStart(10)} (${popBuf.iters} iters)` +
-             `  popAB ${fmtMs(popAB.ms).padStart(10)} (${popAB.iters} iters)` +
-             `  popSet ${fmtMs(popSet.ms).padStart(10)} (${popSet.iters} iters)` +
-             `  b3 ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)` +
-             `  ${fmtTimePerByte(direct.ms, bytes)}` +
-             `  bulk ${fmtMs(bulk.ms).padStart(10)} (${bulk.iters} iters)` +
-             `  ${fmtTimePerByte(bulk.ms, bytes)}` +
-             `  sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters} iters)` +
+             `${sizeLabel.padStart(8)}` +
+             `  popBuf ${fmtMs(popBuf.ms).padStart(10)} (${popBuf.iters})` +
+             `  popAB ${fmtMs(popAB.ms).padStart(10)} (${popAB.iters})` +
+             `  popSet ${fmtMs(popSet.ms).padStart(10)} (${popSet.iters})` +
+             `  b3 ${fmtMs(b3.ms).padStart(10)} (${b3.iters})` +
+             `  ${fmtTimePerByte(b3.ms, bytes)}` +
+             `  sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters})` +
              `  ${fmtTimePerByte(sha.ms, bytes)}` +
-             `  b3-vs-sha ${b3vsSha.toFixed(2)}×`
+             `  b3-vs-sha ${ratio.toFixed(2)}×`
            );
 
            renderMainTable(mainRows);
            await sleep(1);
          }
 
-         // ── Streaming benchmarks ──
-         setStatus('Running streaming benchmarks…');
-         const matrix = PARCEL_COUNTS.map(() => []);
+         // ── Multithreading benchmarks ──
+         setStatus('Running multithreading benchmarks…');
+         const matrix = DATA_SIZES.map(() => []);
 
          for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
            const tc = THREAD_COUNTS[ti];
            let hasher = null;
 
            try {
-             hasher = new MultithreadingHasher(wasmModule, wasmMemory, wasmExports, tc, dataPtr, cvPtr, stacksBase, WORKER_STACK);
+             hasher = new MultithreadingHasher(
+               wasmModule, wasmMemory, wasmExports, tc,
+               dataPtr, outPtr, stacksBase, WORKER_STACK
+             );
              await hasher.init();
 
-             // Correctness check
-             await hasher.hashRegion(DATA_SIZE);
+             await hasher.hashRegion(MAX_DATA);
+             log(`✓ ${tc}T initialized`);
 
-             // Verify exact 32-byte CVs for selected parcels
-             for (const v of TEST_VECTORS) {
-               const outPtr = cvPtr + v.parcel * CV_LEN;
-               const got = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
-               //xxx put this back assertEqHex(`${tc}T parcel=${v.parcel}`, got, v.expected);
-             }
-
-             log(`✓ ${tc}T vectors verified (exact 32-byte match)`);
-
-             for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
-               const pc = PARCEL_COUNTS[pi];
-               const bytes = pc * PARCEL_SIZE;
+             for (let si = 0; si < DATA_SIZES.length; si++) {
+               const bytes = DATA_SIZES[si];
 
                try {
                  const result = await measureAsync(
                    () => hasher.hashRegion(bytes), numM, targetMs
                  );
 
-                 matrix[pi][ti] = { ms: result.ms };
-                 const speedup = directBaseline[pi] / result.ms;
-                 const pad = String(pc).padStart(5);
-                 log(`  ${pad}p × ${String(tc).padStart(2)}T` +
+                 matrix[si][ti] = { ms: result.ms };
+                 const speedup = baseline[si] / result.ms;
+                 log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T` +
                      `  ${fmtMs(result.ms).padStart(10)}  (${result.iters} iters)` +
                      `  ${fmtTimePerByte(result.ms, bytes)}  ${speedup.toFixed(2)}×`);
                } catch (e) {
-                 matrix[pi][ti] = { err: e.message || String(e) };
-                 log(`  ${String(pc).padStart(5)}p × ${String(tc).padStart(2)}T  ❌ ${e.message}`);
+                 matrix[si][ti] = { err: e.message || String(e) };
+                 log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T  ❌ ${e.message}`);
                }
              }
            } catch (e) {
              log(`Failed ${tc}-worker pool: ${e.message || e}`);
-             for (let pi = 0; pi < PARCEL_COUNTS.length; pi++) {
-               matrix[pi][ti] = { err: e.message || String(e) };
+             for (let si = 0; si < DATA_SIZES.length; si++) {
+               matrix[si][ti] = { err: e.message || String(e) };
              }
            }
 
-           renderStreamingTable(matrix, directBaseline);
+           renderMtTable(matrix, baseline);
            await sleep(10);
          }
 
