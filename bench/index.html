@@ -89,12 +89,7 @@
      const OUTPUT_REGION   = MAX_OUTPUTS * CV_LEN;
      const THREAD_COUNTS   = [1, 2, 3, 4, 5, 6];
      const MIN_BLOCK_SIZES = [
-       16 * 1024,          //  16 KiB
-       32 * 1024,          //  32 KiB
-       64 * 1024,          //  64 KiB
-       128 * 1024,         // 128 KiB
-       256 * 1024,         // 256 KiB
-       512 * 1024,         // 512 KiB
+       128 * 1024
      ];
      const WASM_URL = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
@@ -118,12 +113,34 @@
        return n < 1 ? 0 : 1 << (31 - Math.clz32(n));
      }
 
-     // ═══ Predict actual parallelism (mirrors hashRegion logic) ═══
-     function predictActive(len, numWorkers, minBlock) {
-       let chunk = floorPow2(Math.floor(len / numWorkers));
-       if (chunk >= minBlock) return numWorkers;
-       const active = Math.floor(len / minBlock);
-       return active >= 2 ? active : 0;  // 0 = single-threaded fallback
+// ═══ Simple uniform dispatch ═══
+const FIXED_MIN_BLOCK = 128 * 1024;  // 128 KiB
+
+function planDispatch(totalBytes, numWorkers, minBlock) {
+  let active = numWorkers;
+  let chunk = floorPow2(totalBytes / active);
+
+  // Reduce workers until chunk ≥ minBlock
+  while (active > 1 && chunk < minBlock) {
+    active--;
+    chunk = active > 0 ? floorPow2(totalBytes / active) : 0;
+  }
+
+  if (active < 2) {
+    return { chunks: [], mainBytes: totalBytes, chunk: 0 };
+  }
+
+  const mainBytes = totalBytes - active * chunk;
+  return {
+    chunks: new Array(active).fill(chunk),
+    mainBytes,
+    chunk,  // uniform size for all workers
+  };
+}
+
+function predictActive(len, numWorkers, minBlock) {
+  const plan = planDispatch(len, numWorkers, minBlock);
+  return plan.chunks.length;
      }
 
      // ═══ DOM ═══
@@ -288,44 +305,47 @@
        const { promise } = hasher.hashRegion(len, minBlock);
        await promise;
 
-       let chunk = floorPow2(Math.floor(len / numWorkers));
-       let active;
-       if (chunk >= minBlock) {
-         active = numWorkers;
-       } else {
-         chunk = minBlock;
-         active = Math.floor(len / minBlock);
-       }
+       const plan = planDispatch(len, numWorkers, minBlock);
+       const active = plan.chunks.length;
 
        if (active < 2) {
+         // Single-thread fallback — whole-input hash
          const mtHash = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          wasmExports.blake3_hash(dataPtr, len, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          assert(mtHash === ref,
-                `${numWorkers}T mb=${fmtSize(minBlock)} single-thread fallback mismatch`);
+                `${numWorkers}w mb=${fmtSize(minBlock)} single-thread fallback mismatch`);
          return;
        }
 
-       const hasTail = (active * chunk) < len;
+       const hasTail    = plan.mainBytes > 0;
        const numOutputs = active + (hasTail ? 1 : 0);
-       const saved = new Uint8Array(numOutputs * CV_LEN);
+       const saved      = new Uint8Array(numOutputs * CV_LEN);
        saved.set(new Uint8Array(wasmMemory.buffer, outPtr, numOutputs * CV_LEN));
 
+       // Verify each worker chunk (variable sizes now)
+       let offset = 0;
        for (let i = 0; i < active; i++) {
-         wasmExports.blake3_hash(dataPtr + i * chunk, chunk, outPtr);
+         const chunkSize = plan.chunks[i];
+         wasmExports.blake3_hash(dataPtr + offset, chunkSize, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          const got = hex(saved.subarray(i * CV_LEN, (i + 1) * CV_LEN));
          assert(ref === got,
-                `${numWorkers}T mb=${fmtSize(minBlock)} chunk[${i}] mismatch\n  expected: ${ref}\n  got:      ${got}`);
+                `${numWorkers}w mb=${fmtSize(minBlock)} chunk[${i}] ` +
+                `(${fmtSize(chunkSize)}) mismatch\n` +
+                `  expected: ${ref}\n  got:      ${got}`);
+         offset += chunkSize;
        }
 
+       // Verify main-thread tail
        if (hasTail) {
-         const dispatched = active * chunk;
-         wasmExports.blake3_hash(dataPtr + dispatched, len - dispatched, outPtr);
+         wasmExports.blake3_hash(dataPtr + offset, plan.mainBytes, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          const got = hex(saved.subarray(active * CV_LEN, (active + 1) * CV_LEN));
          assert(ref === got,
-                `${numWorkers}T mb=${fmtSize(minBlock)} tail mismatch\n  expected: ${ref}\n  got:      ${got}`);
+                `${numWorkers}w mb=${fmtSize(minBlock)} tail ` +
+                `(${fmtSize(plan.mainBytes)}) mismatch\n` +
+                `  expected: ${ref}\n  got:      ${got}`);
        }
      }
 
@@ -407,8 +427,15 @@
            } else if (cell.err) {
              html += `<td class="err" title="${cell.err}">❌</td>`;
            } else if (cell.skip) {
-             // Underutilized — grey, no results
-             html += `<td class="cell-fallback"><span class="dim">=${cell.effectiveT}T</span></td>`;
+             // Color-code same as the column this fell back to
+             const refTi = THREAD_COUNTS.indexOf(cell.effectiveT);
+             const refCell = refTi >= 0 ? matrix[si]?.[refTi] : null;
+             let cls = 'cell-fallback';
+             if (refCell && refCell.ms != null && !refCell.skip) {
+               const ratio = shaBaseline[si] / refCell.ms;
+               cls = cellClass(ratio);
+             }
+             html += `<td class="${cls}"><span class="dim">=${cell.effectiveT}T</span></td>`;
            } else {
              // Real result (1T baseline or full parallelism)
              const ratio = shaBaseline[si] / cell.ms;
