@@ -56,7 +56,7 @@
     <h2>Main-Thread Benchmarks — BLAKE3 vs WebCrypto SHA-256 (1T)</h2>
     <div id="main-results"></div>
 
-    <h2>Streaming Worker Benchmarks (parcels × threads)</h2>
+    <h2>Multithreading Worker Benchmarks (data size × threads)</h2>
     <p style="color:#aaa; font-size:13px;">Each cell: time/byte · speedup vs single-threaded direct</p>
     <div id="streaming-results"></div>
 
@@ -64,7 +64,7 @@
 
     <script src="coi-serviceworker.min.js"></script>
     <script type="module">
-     import { StreamingHasher } from '../streaming-hasher.js';
+     import { MultithreadingHasher } from '../multithreading-hasher.js';
 
      // ═══ Configuration ═══
      const PARCEL_SIZE   = 16 * 1024;
@@ -183,6 +183,7 @@
      let wasmModule, wasmExports, wasmMemory;
      let dataPtr, cvPtr, stacksBase;
      let sha256Data;
+     let stagingView;
 
      async function initWasm() {
        const resp  = await fetch(WASM_URL);
@@ -223,10 +224,8 @@
        log(`  CVs  @ ${cvPtr}  (${CV_SIZE} bytes)`);
        log(`  stacks @ ${stacksBase}  (${MAX_THREADS * WORKER_STACK} bytes)`);
 
-       const heap = new Uint8Array(wasmMemory.buffer);
-       for (let i = 0; i < DATA_SIZE; i++) heap[dataPtr + i] = i & 0xff;
        sha256Data = new Uint8Array(DATA_SIZE);
-       sha256Data.set(heap.subarray(dataPtr, dataPtr + DATA_SIZE));
+       for (let i = 0; i < DATA_SIZE; i++) sha256Data[i] = i & 0xff;
      }
 
      // ═══ Main-thread hashing ═══
@@ -243,7 +242,11 @@
        for (let i = 0; i < count; i++) hashParcelDirect(i);
      }
 
-     function pokeAll(count) {
+     function hashBulk(bytes) {
+       wasmExports.blake3_hash(dataPtr, bytes, cvPtr);
+     }
+
+     function populateBufferDirect(count) {
        const heap = new Uint8Array(wasmMemory.buffer);
        for (let p = 0; p < count; p++) {
          const base = dataPtr + p * PARCEL_SIZE;
@@ -251,14 +254,29 @@
        }
      }
 
+     function populateViaStaging(count) {
+       const bytes = count * PARCEL_SIZE;
+       for (let i = 0; i < bytes; i++) sha256Data[i] = i & 0xff;
+       new Uint8Array(wasmMemory.buffer, dataPtr, bytes).set(sha256Data.subarray(0, bytes));
+     }
+
+     function populateBulkOnly(count) {
+       const bytes = count * PARCEL_SIZE;
+       new Uint8Array(wasmMemory.buffer, dataPtr, bytes).set(sha256Data.subarray(0, bytes));
+     }
+
      function renderMainTable(rows) {
        let html = `<table>
          <tr>
            <th>Parcels</th>
            <th>Data</th>
-           <th>Poke (write SAB)</th>
+           <th>popBuf (write SAB)</th>
+           <th>popAB+copy (AB→SAB)</th>
+           <th>popSet (→SAB)</th>
            <th>BLAKE3 Direct</th>
            <th>BLAKE3 Time/byte</th>
+           <th>BLAKE3 Bulk</th>
+           <th>Bulk Time/byte</th>
            <th>SHA-256 (WebCrypto, 1T)</th>
            <th>SHA-256 Time/byte</th>
            <th>BLAKE3 vs SHA-256</th>
@@ -267,16 +285,22 @@
        for (const r of rows) {
          const b3vsSha = r.shaMs / r.directMs;
          const cls = b3vsSha >= 1.05 ? 'good' : b3vsSha < 0.95 ? 'bad' : '';
+         const bulkVsSha = r.shaMs / r.bulkMs;
+         const clsBulk = bulkVsSha >= 1.05 ? 'good' : bulkVsSha < 0.95 ? 'bad' : '';
          html += `<tr>
       <td>${r.parcels}</td>
       <td>${r.dataLabel}</td>
-      <td>${fmtMs(r.pokeMs)}</td>
+      <td>${fmtMs(r.popBufMs)}</td>
+      <td>${fmtMs(r.popABMs)}</td>
+      <td>${fmtMs(r.popSetMs)}</td>
       <td>${fmtMs(r.directMs)}</td>
       <td><b>${fmtTimePerByte(r.directMs, r.bytes)}</b></td>
+      <td>${fmtMs(r.bulkMs)}</td>
+      <td><b>${fmtTimePerByte(r.bulkMs, r.bytes)}</b></td>
       <td>${fmtMs(r.shaMs)}</td>
       <td><b>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
-      <td><span class="${cls}">${b3vsSha.toFixed(2)}×</span></td>
-      <td class="dim">${r.pokeIters} / ${r.hashIters} / ${r.shaIters}</td>
+      <td><span class="${cls}">${b3vsSha.toFixed(2)}×</span> / <span class="${clsBulk}">${bulkVsSha.toFixed(2)}×</span></td>
+      <td class="dim">${r.popBufIters} / ${r.popABIters} / ${r.popSetIters} / ${r.hashIters} / ${r.shaIters}</td>
     </tr>`;
        }
        html += '</table>';
@@ -344,8 +368,11 @@
 
            const shaView = sha256Data.subarray(0, bytes);
 
-           const poke   = measureSync(() => pokeAll(pc), numM, targetMs);
+           const popBuf   = measureSync(() => populateBufferDirect(pc), numM, targetMs);
+           const popAB    = measureSync(() => populateViaStaging(pc), numM, targetMs);
+           const popSet   = measureSync(() => populateBulkOnly(pc), numM, targetMs);
            const direct = measureSync(() => hashAllDirect(pc), numM, targetMs);
+           const bulk = measureSync(() => hashBulk(bytes), numM, targetMs);
            const sha    = await measureAsync(
              () => crypto.subtle.digest('SHA-256', shaView),
              numM,
@@ -355,17 +382,24 @@
            directBaseline.push(direct.ms);
            mainRows.push({
              parcels: pc, dataLabel, bytes,
-             pokeMs: poke.ms, pokeIters: poke.iters,
+             popBufMs: popBuf.ms, popBufIters: popBuf.iters,
+             popABMs: popAB.ms, popABIters: popAB.iters,
+             popSetMs: popSet.ms, popSetIters: popSet.iters,
              directMs: direct.ms, hashIters: direct.iters,
+             bulkMs: bulk.ms, bulkIters: bulk.iters,
              shaMs: sha.ms, shaIters: sha.iters,
            });
 
            const pad = String(pc).padStart(4);
            const b3vsSha = sha.ms / direct.ms;
            log(
-             `${pad}p  poke ${fmtMs(poke.ms).padStart(10)} (${poke.iters} iters)` +
+             `${pad}p  popBuf ${fmtMs(popBuf.ms).padStart(10)} (${popBuf.iters} iters)` +
+             `  popAB ${fmtMs(popAB.ms).padStart(10)} (${popAB.iters} iters)` +
+             `  popSet ${fmtMs(popSet.ms).padStart(10)} (${popSet.iters} iters)` +
              `  b3 ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)` +
              `  ${fmtTimePerByte(direct.ms, bytes)}` +
+             `  bulk ${fmtMs(bulk.ms).padStart(10)} (${bulk.iters} iters)` +
+             `  ${fmtTimePerByte(bulk.ms, bytes)}` +
              `  sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters} iters)` +
              `  ${fmtTimePerByte(sha.ms, bytes)}` +
              `  b3-vs-sha ${b3vsSha.toFixed(2)}×`
@@ -383,18 +417,12 @@
            const tc = THREAD_COUNTS[ti];
            let hasher = null;
 
-
            try {
-             hasher = new StreamingHasher(wasmModule, wasmMemory, tc, {
-               dataPtr,
-               cvPtr,
-               parcelSize: PARCEL_SIZE,
-               maxParcels: MAX_PARCELS,
-             });
+             hasher = new MultithreadingHasher(wasmModule, wasmMemory, wasmExports, tc, dataPtr, cvPtr, stacksBase, WORKER_STACK);
              await hasher.init();
 
              // Correctness check
-             await hasher.hashParcels(MAX_PARCELS);
+             await hasher.hashRegion(DATA_SIZE);
 
              // Verify exact 32-byte CVs for selected parcels
              for (const v of TEST_VECTORS) {
@@ -411,7 +439,7 @@
 
                try {
                  const result = await measureAsync(
-                   () => hasher.hashParcels(pc), numM, targetMs
+                   () => hasher.hashRegion(bytes), numM, targetMs
                  );
 
                  matrix[pi][ti] = { ms: result.ms };

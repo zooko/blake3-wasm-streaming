@@ -21,9 +21,7 @@ self.onmessage = async (e) => {
 
             const ex = instance.exports;
 
-            //xxxassert(typeof msg.dataPtr === 'bigint')
             dataPtrBase = msg.dataPtr;
-            //xxxassert(typeof msg.cvPtr === 'bigint')
             cvPtrBase = msg.cvPtr;
 
             hashFn = ex.hash_parcel_to_cv_from_ptr;

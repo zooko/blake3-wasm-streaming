@@ -1,7 +1,16 @@
 use core::{ptr, slice};
 
-const PARCEL_SIZE: usize = 16 * 1024;
 const CV_SIZE: usize = 32;
+
+#[no_mangle]
+pub unsafe extern "C" fn blake3_hash(data_ptr: *const u8, data_len: usize, out_ptr: *mut u8) {
+    let data = core::slice::from_raw_parts(data_ptr, data_len);
+    let hash = blake3::hash(data);
+    core::slice::from_raw_parts_mut(out_ptr, CV_SIZE).copy_from_slice(hash.as_bytes());
+}
+
+
+const PARCEL_SIZE: usize = 16 * 1024;
 
 // ── Single-parcel hashing ───────────────────────────────────
 
@@ -27,7 +36,7 @@ pub extern "C" fn hash_parcel_to_cv_from_ptr(
 // ── Batch-parcel hashing ────────────────────────────────────
 
 #[no_mangle]
-pub extern "C" fn hash_parcels_to_cvs_from_ptr(
+pub extern "C" fn xxx_CURRENTLY_UNUSED_hash_parcels_to_cvs_from_ptr(
     input_ptr: usize,
     input_len: usize,
     out_ptr: usize,
@@ -37,11 +46,11 @@ pub extern "C" fn hash_parcels_to_cvs_from_ptr(
     let out_len = input_len / PARCEL_SIZE * CV_SIZE;
 
     let out = unsafe { slice::from_raw_parts_mut(out_ptr as *mut u8, out_len) };
-    hash_parcels_to_cvs(input, out)
+    xxx_currently_unused_hash_parcels_to_cvs(input, out)
 }
 
 #[inline]
-fn hash_parcels_to_cvs(input: &[u8], out: &mut [u8]) -> usize {
+fn xxx_currently_unused_hash_parcels_to_cvs(input: &[u8], out: &mut [u8]) -> usize {
     let num_parcels = input.len() / PARCEL_SIZE;
     debug_assert!(input.len().is_multiple_of(PARCEL_SIZE));
     debug_assert!(out.len() >= num_parcels * CV_SIZE);
@@ -59,16 +68,4 @@ fn hash_parcels_to_cvs(input: &[u8], out: &mut [u8]) -> usize {
         }
     }
     num_parcels
-}
-
-// ── Sizing helpers ──────────────────────────────────────────
-
-#[no_mangle]
-pub extern "C" fn num_64k_parcels(input_len: usize) -> usize {
-    input_len / PARCEL_SIZE
-}
-
-#[no_mangle]
-pub extern "C" fn bytes_needed_for_64k_parcel_cvs(input_len: usize) -> usize {
-    input_len / PARCEL_SIZE * CV_SIZE
 }
