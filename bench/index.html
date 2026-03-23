@@ -113,34 +113,34 @@
        return n < 1 ? 0 : 1 << (31 - Math.clz32(n));
      }
 
-// ═══ Simple uniform dispatch ═══
-const FIXED_MIN_BLOCK = 128 * 1024;  // 128 KiB
+     // ═══ Simple uniform dispatch ═══
+     const FIXED_MIN_BLOCK = 128 * 1024;  // 128 KiB
 
-function planDispatch(totalBytes, numWorkers, minBlock) {
-  let active = numWorkers;
-  let chunk = floorPow2(totalBytes / active);
+     function planDispatch(totalBytes, numWorkers, minBlock) {
+       let active = numWorkers;
+       let chunk = floorPow2(totalBytes / active);
 
-  // Reduce workers until chunk ≥ minBlock
-  while (active > 1 && chunk < minBlock) {
-    active--;
-    chunk = active > 0 ? floorPow2(totalBytes / active) : 0;
-  }
+       // Reduce workers until chunk ≥ minBlock
+       while (active > 1 && chunk < minBlock) {
+         active--;
+         chunk = active > 0 ? floorPow2(totalBytes / active) : 0;
+       }
 
-  if (active < 2) {
-    return { chunks: [], mainBytes: totalBytes, chunk: 0 };
-  }
+       if (active < 2) {
+         return { chunks: [], mainBytes: totalBytes, chunk: 0 };
+       }
 
-  const mainBytes = totalBytes - active * chunk;
-  return {
-    chunks: new Array(active).fill(chunk),
-    mainBytes,
-    chunk,  // uniform size for all workers
-  };
-}
+       const mainBytes = totalBytes - active * chunk;
+       return {
+         chunks: new Array(active).fill(chunk),
+         mainBytes,
+         chunk,  // uniform size for all workers
+       };
+     }
 
-function predictActive(len, numWorkers, minBlock) {
-  const plan = planDispatch(len, numWorkers, minBlock);
-  return plan.chunks.length;
+     function predictActive(len, numWorkers, minBlock) {
+       const plan = planDispatch(len, numWorkers, minBlock);
+       return plan.chunks.length;
      }
 
      // ═══ DOM ═══
