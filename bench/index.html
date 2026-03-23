@@ -12,7 +12,7 @@
        max-width: 1400px;
        margin: 0 auto;
      }
-     h1, h2 { color: #1d4ed8; }
+     h1, h2, h3 { color: #1d4ed8; }
      table { border-collapse: collapse; margin: 10px 0; }
      th, td {
        border: 1px solid #d1d5db;
@@ -35,10 +35,10 @@
      }
      button { font-size: 16px; padding: 8px 20px; margin: 5px 5px 5px 0; cursor: pointer; }
      button:disabled { opacity: 0.4; cursor: default; }
-     .good { color: #166534; }
-     .bad { color: #b91c1c; }
      .err { color: #b91c1c; font-weight: bold; }
      .dim { color: #6b7280; font-size: 0.85em; }
+     .cell-win  { background-color: #dcfce7; }
+     .cell-lose { background-color: #fee2e2; }
      #status { font-weight: bold; margin: 10px 0; }
     </style>
   </head>
@@ -56,8 +56,12 @@
     <h2>Main-Thread Benchmarks — BLAKE3 vs WebCrypto SHA-256 (1T)</h2>
     <div id="main-results"></div>
 
-    <h2>Multithreading Worker Benchmarks (data size × threads)</h2>
-    <p style="color:#aaa; font-size:13px;">Each cell: time/byte · speedup vs single-threaded BLAKE3</p>
+    <h2>Multithreading Benchmarks</h2>
+    <p style="color:#888; font-size:13px;">
+      Each cell: time/byte · ratio vs SHA-256.<br>
+      <span style="background:#dcfce7;padding:1px 6px;">Green</span> = BLAKE3 &gt;10% faster than SHA-256.
+      <span style="background:#fee2e2;padding:1px 6px;">Red</span> = SHA-256 &gt;10% faster than BLAKE3.
+    </p>
     <div id="mt-results"></div>
 
     <pre id="log"></pre>
@@ -76,37 +80,40 @@
        512 * 1024,         //  512 KiB
        1024 * 1024,        //    1 MiB
        2 * 1024 * 1024,    //    2 MiB
-       4 * 1024 * 1024,    //    4 MiB
-       8 * 1024 * 1024,    //    8 MiB
      ];
-     const MAX_DATA      = DATA_SIZES[DATA_SIZES.length - 1];
-     const CV_LEN        = 32;
-     const MAX_OUTPUTS   = 256;
-     const OUTPUT_REGION = MAX_OUTPUTS * CV_LEN;
-     const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8];
-     const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
+     const MAX_DATA        = DATA_SIZES[DATA_SIZES.length - 1];
+     const CV_LEN          = 32;
+     const MAX_OUTPUTS     = 256;
+     const OUTPUT_REGION   = MAX_OUTPUTS * CV_LEN;
+     const THREAD_COUNTS   = [1, 2, 3, 4, 5, 6];
+     const MIN_BLOCK_SIZES = [
+       16 * 1024,          //  16 KiB
+       32 * 1024,          //  32 KiB
+       64 * 1024,          //  64 KiB
+       128 * 1024,         // 128 KiB
+       256 * 1024,         // 256 KiB
+       512 * 1024,         // 512 KiB
+     ];
+     const WASM_URL = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
-     const WORKER_STACK  = 65536;
-     const MAX_THREADS   = 256;
-     const PTR_ALIGN     = 16;
-     const WASM_PAGE     = 65536;
+     const WORKER_STACK = 65536;
+     const MAX_THREADS  = 256;
+     const PTR_ALIGN    = 16;
+     const WASM_PAGE    = 65536;
 
-     const MEAS_FULL     = 9;
-     const MEAS_QUICK    = 5;
+     const MEAS_FULL  = 9;
+     const MEAS_QUICK = 5;
 
      // ═══ Test Vectors ═══
-     // BLAKE3 hash of the repeating byte pattern [0, 1, 2, …, 255, 0, 1, …]
-     // truncated to the given length.
-     // Set expected to null → logs computed hex so you can paste it back.
+     // BLAKE3 hash of the repeating pattern [0,1,2,…,255,0,1,…] at given length.
+     // Set expected to null → logs hex so you can paste it back.
      const TEST_VECTORS = [
        { bytes: 16 * 1024,       expected: 'd49d367e4b0011a34510a28a1eb0caeb3e51e77ff2d30136849454640fefefc1' },
        { bytes: 256 * 1024,      expected: 'b7db553d6c87096cf988bc6550f37b3f5d5f95537dd18ece86c047f97e786282' },
        { bytes: 1024 * 1024,     expected: '64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533' },
-       { bytes: 8 * 1024 * 1024, expected: '16b79b891510f1f584266448c9ca6f229d81265a9d2801074c2098e46a3d2383' },
+       { bytes: 2 * 1024 * 1024, expected: null },
      ];
 
-     // Must match multithreading-hasher.js
-     const MT_MIN_BLOCK = 1 << 17;
      function floorPow2(n) {
        return n < 1 ? 0 : 1 << (31 - Math.clz32(n));
      }
@@ -121,12 +128,8 @@
      function setError(msg)  { statusEl.textContent = msg; statusEl.className = 'err'; }
      function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
 
-     function assert(cond, msg) {
-       if (!cond) throw new Error(msg);
-     }
-     function alignUp(x, align) {
-       return Math.ceil(x / align) * align;
-     }
+     function assert(cond, msg) { if (!cond) throw new Error(msg); }
+     function alignUp(x, align) { return Math.ceil(x / align) * align; }
 
      function fmtSize(bytes) {
        if (bytes >= 1048576) return `${bytes / 1048576} MiB`;
@@ -193,7 +196,7 @@
        return { ms: times[Math.floor(times.length / 2)], iters };
      }
 
-     // ═══ WASM (main-thread instance) ═══
+     // ═══ WASM ═══
      let wasmModule, wasmExports, wasmMemory;
      let dataPtr, outPtr, stacksBase;
      let sha256Data;
@@ -244,7 +247,7 @@
        sha256Data.set(heap.subarray(dataPtr, dataPtr + MAX_DATA));
      }
 
-     // ═══ Verification (runs outside all benchmark timing) ═══
+     // ═══ Verification (outside all benchmark timing) ═══
 
      function verifyTestVectors() {
        log('');
@@ -272,18 +275,18 @@
        else log('  All test vectors passed ✓');
      }
 
-     async function verifyMtCorrectness(hasher, numWorkers) {
+     async function verifyMtCorrectness(hasher, numWorkers, minBlock) {
        const len = MAX_DATA;
-       await hasher.hashRegion(len);
+       await hasher.hashRegion(len, minBlock);
 
-       // Replicate chunk-splitting logic from MultithreadingHasher.hashRegion
+       // Replicate chunk-splitting logic from hashRegion
        let chunk = floorPow2(Math.floor(len / numWorkers));
        let active;
-       if (chunk >= MT_MIN_BLOCK) {
+       if (chunk >= minBlock) {
          active = numWorkers;
        } else {
-         chunk = MT_MIN_BLOCK;
-         active = Math.floor(len / MT_MIN_BLOCK);
+         chunk = minBlock;
+         active = Math.floor(len / minBlock);
        }
 
        if (active < 2) {
@@ -291,8 +294,8 @@
          const mtHash = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          wasmExports.blake3_hash(dataPtr, len, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
-         assert(mtHash === ref, `${numWorkers}T single-thread fallback mismatch`);
-         log(`✓ ${numWorkers}T verified (single-thread fallback)`);
+         assert(mtHash === ref,
+           `${numWorkers}T mb=${fmtSize(minBlock)} single-thread fallback mismatch`);
          return;
        }
 
@@ -302,26 +305,23 @@
        const saved = new Uint8Array(numOutputs * CV_LEN);
        saved.set(new Uint8Array(wasmMemory.buffer, outPtr, numOutputs * CV_LEN));
 
-       // Re-hash each worker's chunk on the main thread and compare
+       // Re-hash each worker's chunk on main thread and compare
        for (let i = 0; i < active; i++) {
          wasmExports.blake3_hash(dataPtr + i * chunk, chunk, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          const got = hex(saved.subarray(i * CV_LEN, (i + 1) * CV_LEN));
          assert(ref === got,
-           `${numWorkers}T chunk[${i}] mismatch\n  expected: ${ref}\n  got:      ${got}`);
+           `${numWorkers}T mb=${fmtSize(minBlock)} chunk[${i}] mismatch\n  expected: ${ref}\n  got:      ${got}`);
        }
 
-       // Verify tail (hashed by main thread inside hashRegion)
        if (hasTail) {
          const dispatched = active * chunk;
          wasmExports.blake3_hash(dataPtr + dispatched, len - dispatched, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          const got = hex(saved.subarray(active * CV_LEN, (active + 1) * CV_LEN));
          assert(ref === got,
-           `${numWorkers}T tail mismatch\n  expected: ${ref}\n  got:      ${got}`);
+           `${numWorkers}T mb=${fmtSize(minBlock)} tail mismatch\n  expected: ${ref}\n  got:      ${got}`);
        }
-
-       log(`✓ ${numWorkers}T verified (${active} chunks${hasTail ? ' + tail' : ''})`);
      }
 
      // ═══ Main-thread hashing ═══
@@ -343,6 +343,17 @@
        new Uint8Array(wasmMemory.buffer, dataPtr, bytes).set(sha256Data.subarray(0, bytes));
      }
 
+     // ═══ Rendering ═══
+
+     function cellClass(ratio) {
+       // ratio = sha256_time / blake3_time
+       // > 1.10 → BLAKE3 wins by >10%   (green)
+       // < 0.90 → SHA-256 wins by >10%  (red)
+       if (ratio > 1.10) return 'cell-win';
+       if (ratio < 0.90) return 'cell-lose';
+       return '';
+     }
+
      function renderMainTable(rows) {
        let html = `<table>
          <tr>
@@ -359,7 +370,6 @@
          </tr>`;
        for (const r of rows) {
          const ratio = r.shaMs / r.b3Ms;
-         const cls = ratio >= 1.05 ? 'good' : ratio < 0.95 ? 'bad' : '';
          html += `<tr>
       <td>${r.sizeLabel}</td>
       <td>${fmtMs(r.popBufMs)}</td>
@@ -369,7 +379,7 @@
       <td><b>${fmtTimePerByte(r.b3Ms, r.bytes)}</b></td>
       <td>${fmtMs(r.shaMs)}</td>
       <td><b>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
-      <td><span class="${cls}">${ratio.toFixed(2)}×</span></td>
+      <td class="${cellClass(ratio)}"><b>${ratio.toFixed(2)}×</b></td>
       <td class="dim">${r.popBufIters} / ${r.popABIters} / ${r.popSetIters} / ${r.b3Iters} / ${r.shaIters}</td>
     </tr>`;
        }
@@ -377,8 +387,9 @@
        document.getElementById('main-results').innerHTML = html;
      }
 
-     function renderMtTable(matrix, baseline) {
-       let html = '<table><tr><th>Size╲Threads</th>';
+     function renderOneMtTable(minBlock, matrix, b3Baseline, shaBaseline) {
+       let html = `<h3>MIN_BLOCK = ${fmtSize(minBlock)}</h3>`;
+       html += '<table><tr><th>Size╲Threads</th>';
        for (const t of THREAD_COUNTS) html += `<th>${t}T</th>`;
        html += '</tr>';
 
@@ -394,15 +405,14 @@
              html += `<td class="err" title="${cell.err}">❌</td>`;
            } else {
              const tpb = fmtTimePerByte(cell.ms, bytes);
-             const speedup = baseline[si] / cell.ms;
-             const cls = speedup >= 1.05 ? 'good' : speedup < 0.95 ? 'bad' : '';
-             html += `<td>${tpb}<br><span class="dim ${cls}">${speedup.toFixed(2)}×</span></td>`;
+             const vsSha = shaBaseline[si] / cell.ms;
+             html += `<td class="${cellClass(vsSha)}">${tpb}<br><span class="dim">${vsSha.toFixed(2)}× vs SHA</span></td>`;
            }
          }
          html += '</tr>';
        }
        html += '</table>';
-       document.getElementById('mt-results').innerHTML = html;
+       return html;
      }
 
      // ═══ Main benchmark runner ═══
@@ -430,8 +440,9 @@
          await sleep(50);
 
          // ── Main-thread benchmarks ──
-         const mainRows = [];
-         const baseline = [];
+         const mainRows    = [];
+         const b3Baseline  = [];
+         const shaBaseline = [];
 
          for (const bytes of DATA_SIZES) {
            const sizeLabel = fmtSize(bytes);
@@ -445,7 +456,8 @@
              () => crypto.subtle.digest('SHA-256', shaView), numM, targetMs
            );
 
-           baseline.push(b3.ms);
+           b3Baseline.push(b3.ms);
+           shaBaseline.push(sha.ms);
            mainRows.push({
              sizeLabel, bytes,
              popBufMs: popBuf.ms, popBufIters: popBuf.iters,
@@ -472,55 +484,73 @@
            await sleep(1);
          }
 
-         // ── Multithreading benchmarks ──
-         setStatus('Running multithreading benchmarks…');
-         const matrix = DATA_SIZES.map(() => []);
+         // ── Create all MT hashers (one per thread count, reused across MIN_BLOCKs) ──
+         setStatus('Creating worker pools…');
+         const hashers = [];
+         for (const tc of THREAD_COUNTS) {
+           const h = new MultithreadingHasher(
+             wasmModule, wasmMemory, wasmExports, tc,
+             dataPtr, outPtr, stacksBase, WORKER_STACK
+           );
+           await h.init();
+           hashers.push(h);
+           log(`  ${tc}T worker pool ready`);
+         }
 
-         for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
-           const tc = THREAD_COUNTS[ti];
-           let hasher = null;
+         // ── MT benchmarks — one table per MIN_BLOCK ──
+         const allMtHtml = [];
 
-           try {
-             hasher = new MultithreadingHasher(
-               wasmModule, wasmMemory, wasmExports, tc,
-               dataPtr, outPtr, stacksBase, WORKER_STACK
-             );
-             await hasher.init();
+         for (let mi = 0; mi < MIN_BLOCK_SIZES.length; mi++) {
+           const minBlock = MIN_BLOCK_SIZES[mi];
+           const matrix = DATA_SIZES.map(() => []);
 
-             // ── MT correctness verification (outside timing) ──
-             await verifyMtCorrectness(hasher, tc);
+           setStatus(`MT benchmarks — MIN_BLOCK = ${fmtSize(minBlock)}…`);
+           log(`\n── MIN_BLOCK = ${fmtSize(minBlock)} ──`);
+
+           // Verify all thread counts for this minBlock (outside timing)
+           for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
+             await verifyMtCorrectness(hashers[ti], THREAD_COUNTS[ti], minBlock);
+           }
+           log(`  ✓ All thread counts verified`);
+
+           // Benchmark
+           for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
+             const tc     = THREAD_COUNTS[ti];
+             const hasher = hashers[ti];
 
              for (let si = 0; si < DATA_SIZES.length; si++) {
                const bytes = DATA_SIZES[si];
 
                try {
                  const result = await measureAsync(
-                   () => hasher.hashRegion(bytes), numM, targetMs
+                   () => hasher.hashRegion(bytes, minBlock), numM, targetMs
                  );
 
                  matrix[si][ti] = { ms: result.ms };
-                 const speedup = baseline[si] / result.ms;
+                 const vsSha   = shaBaseline[si] / result.ms;
+                 const vs1T    = b3Baseline[si] / result.ms;
                  log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T` +
                      `  ${fmtMs(result.ms).padStart(10)}  (${result.iters} iters)` +
-                     `  ${fmtTimePerByte(result.ms, bytes)}  ${speedup.toFixed(2)}×`);
+                     `  ${fmtTimePerByte(result.ms, bytes)}` +
+                     `  ${vsSha.toFixed(2)}× vs SHA` +
+                     `  ${vs1T.toFixed(2)}× vs 1T`);
                } catch (e) {
                  matrix[si][ti] = { err: e.message || String(e) };
                  log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T  ❌ ${e.message}`);
                }
              }
-           } catch (e) {
-             log(`Failed ${tc}-worker pool: ${e.message || e}`);
-             for (let si = 0; si < DATA_SIZES.length; si++) {
-               matrix[si][ti] = { err: e.message || String(e) };
-             }
-           }
 
-           renderMtTable(matrix, baseline);
-           await sleep(10);
+             allMtHtml[mi] = renderOneMtTable(minBlock, matrix, b3Baseline, shaBaseline);
+             document.getElementById('mt-results').innerHTML = allMtHtml.join('');
+             await sleep(10);
+           }
          }
 
+         // Cleanup
+         for (const h of hashers) h.terminate();
+
          setStatus('Done!');
-         log('════ All benchmarks complete ════');
+         log('\n════ All benchmarks complete ════');
        } catch (e) {
          setError(`Error: ${e.message || e}`);
          log(`FATAL: ${e.stack || e}`);
