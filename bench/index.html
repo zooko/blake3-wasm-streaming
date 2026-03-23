@@ -39,6 +39,7 @@
      .dim { color: #6b7280; font-size: 0.85em; }
      .cell-win  { background-color: #dcfce7; }
      .cell-lose { background-color: #fee2e2; }
+     .cell-fallback { background-color: #f3f4f6; color: #9ca3af; }
      #status { font-weight: bold; margin: 10px 0; }
     </style>
   </head>
@@ -58,9 +59,10 @@
 
     <h2>Multithreading Benchmarks</h2>
     <p style="color:#888; font-size:13px;">
-      Each cell: time/byte · ratio vs SHA-256.<br>
+      Each cell: time/byte · ratio vs SHA-256 · actual workers used.<br>
       <span style="background:#dcfce7;padding:1px 6px;">Green</span> = BLAKE3 &gt;10% faster than SHA-256.
       <span style="background:#fee2e2;padding:1px 6px;">Red</span> = SHA-256 &gt;10% faster than BLAKE3.
+      <span style="background:#f3f4f6;padding:1px 6px;color:#9ca3af;">Grey</span> = fell back to single-threaded (data too small for MIN_BLOCK).
     </p>
     <div id="mt-results"></div>
 
@@ -105,8 +107,6 @@
      const MEAS_QUICK = 5;
 
      // ═══ Test Vectors ═══
-     // BLAKE3 hash of the repeating pattern [0,1,2,…,255,0,1,…] at given length.
-     // Set expected to null → logs hex so you can paste it back.
      const TEST_VECTORS = [
        { bytes: 16 * 1024,       expected: 'd49d367e4b0011a34510a28a1eb0caeb3e51e77ff2d30136849454640fefefc1' },
        { bytes: 256 * 1024,      expected: 'b7db553d6c87096cf988bc6550f37b3f5d5f95537dd18ece86c047f97e786282' },
@@ -116,6 +116,14 @@
 
      function floorPow2(n) {
        return n < 1 ? 0 : 1 << (31 - Math.clz32(n));
+     }
+
+     // ═══ Predict actual parallelism (mirrors hashRegion logic) ═══
+     function predictActive(len, numWorkers, minBlock) {
+       let chunk = floorPow2(Math.floor(len / numWorkers));
+       if (chunk >= minBlock) return numWorkers;
+       const active = Math.floor(len / minBlock);
+       return active >= 2 ? active : 0;  // 0 = single-threaded fallback
      }
 
      // ═══ DOM ═══
@@ -247,7 +255,7 @@
        sha256Data.set(heap.subarray(dataPtr, dataPtr + MAX_DATA));
      }
 
-     // ═══ Verification (outside all benchmark timing) ═══
+     // ═══ Verification ═══
 
      function verifyTestVectors() {
        log('');
@@ -277,9 +285,9 @@
 
      async function verifyMtCorrectness(hasher, numWorkers, minBlock) {
        const len = MAX_DATA;
-       await hasher.hashRegion(len, minBlock);
+       const { promise } = hasher.hashRegion(len, minBlock);
+       await promise;
 
-       // Replicate chunk-splitting logic from hashRegion
        let chunk = floorPow2(Math.floor(len / numWorkers));
        let active;
        if (chunk >= minBlock) {
@@ -290,28 +298,25 @@
        }
 
        if (active < 2) {
-         // Single-threaded fallback — one hash at outPtr
          const mtHash = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          wasmExports.blake3_hash(dataPtr, len, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          assert(mtHash === ref,
-           `${numWorkers}T mb=${fmtSize(minBlock)} single-thread fallback mismatch`);
+                `${numWorkers}T mb=${fmtSize(minBlock)} single-thread fallback mismatch`);
          return;
        }
 
-       // Save MT outputs before we overwrite outPtr
        const hasTail = (active * chunk) < len;
        const numOutputs = active + (hasTail ? 1 : 0);
        const saved = new Uint8Array(numOutputs * CV_LEN);
        saved.set(new Uint8Array(wasmMemory.buffer, outPtr, numOutputs * CV_LEN));
 
-       // Re-hash each worker's chunk on main thread and compare
        for (let i = 0; i < active; i++) {
          wasmExports.blake3_hash(dataPtr + i * chunk, chunk, outPtr);
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          const got = hex(saved.subarray(i * CV_LEN, (i + 1) * CV_LEN));
          assert(ref === got,
-           `${numWorkers}T mb=${fmtSize(minBlock)} chunk[${i}] mismatch\n  expected: ${ref}\n  got:      ${got}`);
+                `${numWorkers}T mb=${fmtSize(minBlock)} chunk[${i}] mismatch\n  expected: ${ref}\n  got:      ${got}`);
        }
 
        if (hasTail) {
@@ -320,7 +325,7 @@
          const ref = hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
          const got = hex(saved.subarray(active * CV_LEN, (active + 1) * CV_LEN));
          assert(ref === got,
-           `${numWorkers}T mb=${fmtSize(minBlock)} tail mismatch\n  expected: ${ref}\n  got:      ${got}`);
+                `${numWorkers}T mb=${fmtSize(minBlock)} tail mismatch\n  expected: ${ref}\n  got:      ${got}`);
        }
      }
 
@@ -346,9 +351,6 @@
      // ═══ Rendering ═══
 
      function cellClass(ratio) {
-       // ratio = sha256_time / blake3_time
-       // > 1.10 → BLAKE3 wins by >10%   (green)
-       // < 0.90 → SHA-256 wins by >10%  (red)
        if (ratio > 1.10) return 'cell-win';
        if (ratio < 0.90) return 'cell-lose';
        return '';
@@ -399,14 +401,19 @@
 
          for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
            const cell = matrix[si]?.[ti];
+
            if (!cell) {
              html += '<td>—</td>';
            } else if (cell.err) {
              html += `<td class="err" title="${cell.err}">❌</td>`;
+           } else if (cell.skip) {
+             // Underutilized — grey, no results
+             html += `<td class="cell-fallback"><span class="dim">=${cell.effectiveT}T</span></td>`;
            } else {
-             const tpb = fmtTimePerByte(cell.ms, bytes);
-             const vsSha = shaBaseline[si] / cell.ms;
-             html += `<td class="${cellClass(vsSha)}">${tpb}<br><span class="dim">${vsSha.toFixed(2)}× vs SHA</span></td>`;
+             // Real result (1T baseline or full parallelism)
+             const ratio = shaBaseline[si] / cell.ms;
+             html += `<td class="${cellClass(ratio)}">${fmtTimePerByte(cell.ms, bytes)}<br>`
+                   + `<span class="dim">${ratio.toFixed(2)}× vs SHA</span></td>`;
            }
          }
          html += '</tr>';
@@ -431,7 +438,6 @@
          setStatus('Loading WASM…');
          await initWasm();
 
-         // ── Correctness verification (outside all timing) ──
          verifyTestVectors();
 
          log('');
@@ -484,12 +490,14 @@
            await sleep(1);
          }
 
-         // ── Create all MT hashers (one per thread count, reused across MIN_BLOCKs) ──
+         // ── Create all MT hashers ──
          setStatus('Creating worker pools…');
          const hashers = [];
          for (const tc of THREAD_COUNTS) {
+           if (tc === 1) continue;
+           const workers = tc - 1;
            const h = new MultithreadingHasher(
-             wasmModule, wasmMemory, wasmExports, tc,
+             wasmModule, wasmMemory, wasmExports, workers,
              dataPtr, outPtr, stacksBase, WORKER_STACK
            );
            await h.init();
@@ -497,7 +505,6 @@
            log(`  ${tc}T worker pool ready`);
          }
 
-         // ── MT benchmarks — one table per MIN_BLOCK ──
          const allMtHtml = [];
 
          for (let mi = 0; mi < MIN_BLOCK_SIZES.length; mi++) {
@@ -507,30 +514,52 @@
            setStatus(`MT benchmarks — MIN_BLOCK = ${fmtSize(minBlock)}…`);
            log(`\n── MIN_BLOCK = ${fmtSize(minBlock)} ──`);
 
-           // Verify all thread counts for this minBlock (outside timing)
-           for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
-             await verifyMtCorrectness(hashers[ti], THREAD_COUNTS[ti], minBlock);
+           // ─── FIX 1: verification skips 1T, uses hashers[ti-1] ───
+           for (let ti = 1; ti < THREAD_COUNTS.length; ti++) {
+             const tc = THREAD_COUNTS[ti];
+             await verifyMtCorrectness(hashers[ti - 1], tc - 1, minBlock);
            }
-           log(`  ✓ All thread counts verified`);
+           log(`  ✓ All worker pools verified`);
 
-           // Benchmark
-           for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
-             const tc     = THREAD_COUNTS[ti];
-             const hasher = hashers[ti];
+           // ─── FIX 2: 1T column from baseline (replaces old "// Benchmark" block) ───
+           for (let si = 0; si < DATA_SIZES.length; si++) {
+             matrix[si][0] = { ms: b3Baseline[si], active: 0 };
+           }
+
+           // ─── FIX 2 continued: 2T…6T columns ───
+           for (let ti = 1; ti < THREAD_COUNTS.length; ti++) {
+             const tc      = THREAD_COUNTS[ti];
+             const workers = tc - 1;
+             const hasher  = hashers[ti - 1];
 
              for (let si = 0; si < DATA_SIZES.length; si++) {
-               const bytes = DATA_SIZES[si];
+               const bytes     = DATA_SIZES[si];
+               const predicted = predictActive(bytes, workers, minBlock);
+
+               if (predicted < workers) {
+                 const effectiveT = predicted === 0 ? 1 : predicted + 1;
+                 matrix[si][ti] = { skip: true, effectiveT };
+                 log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T  → =${effectiveT}T`);
+                 continue;
+               }
 
                try {
+                 let observedActive = null;
                  const result = await measureAsync(
-                   () => hasher.hashRegion(bytes, minBlock), numM, targetMs
+                   async () => {
+                     const { promise, activeWorkers } = hasher.hashRegion(bytes, minBlock);
+                     if (observedActive === null) observedActive = activeWorkers;
+                     await promise;
+                   },
+                   numM, targetMs
                  );
 
-                 matrix[si][ti] = { ms: result.ms };
-                 const vsSha   = shaBaseline[si] / result.ms;
-                 const vs1T    = b3Baseline[si] / result.ms;
+                 matrix[si][ti] = { ms: result.ms, active: observedActive };
+
+                 const vsSha = shaBaseline[si] / result.ms;
+                 const vs1T  = b3Baseline[si] / result.ms;
                  log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T` +
-                     `  ${fmtMs(result.ms).padStart(10)}  (${result.iters} iters)` +
+                     `  ${fmtMs(result.ms).padStart(10)}  (${result.iters} iters, ${observedActive}w)` +
                      `  ${fmtTimePerByte(result.ms, bytes)}` +
                      `  ${vsSha.toFixed(2)}× vs SHA` +
                      `  ${vs1T.toFixed(2)}× vs 1T`);
@@ -544,9 +573,8 @@
              document.getElementById('mt-results').innerHTML = allMtHtml.join('');
              await sleep(10);
            }
-         }
+         }  // end for mi
 
-         // Cleanup
          for (const h of hashers) h.terminate();
 
          setStatus('Done!');
