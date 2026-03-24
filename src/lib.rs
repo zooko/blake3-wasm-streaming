@@ -12,10 +12,10 @@ const CV_SIZE: usize = 32;
 
 // Public runtime/layout config.
 const MAX_DATA: usize = 2_000_000;
-const MIN_BLOCK: usize = 64 * 1024;
+const MIN_SLICE: usize = 4 * 1024;
 const MAX_THREADS: usize = 4; // total lanes including caller
 const BG_WORKERS: usize = MAX_THREADS - 1;
-const MAX_BLOCKS: usize = (MAX_DATA + MIN_BLOCK - 1) / MIN_BLOCK;
+const MAX_SLICES: usize = (MAX_DATA + MIN_SLICE - 1) / MIN_SLICE;
 
 const ALIGN: usize = 16;
 const PAGE: usize = 65536;
@@ -26,7 +26,7 @@ const CTRL_WORDS: usize = 7;
 const CTRL_BYTES: usize = CTRL_WORDS * mem::size_of::<i32>();
 
 const GEN: usize = 0;
-const CHUNK: usize = 1;
+const SLICE_SIZE: usize = 1;
 const ACTIVE: usize = 2; // active background workers, not counting caller
 const DONE: usize = 3;
 const SIGNAL: usize = 4;
@@ -59,10 +59,10 @@ unsafe fn at(c: *mut i32, i: usize) -> &'static AtomicI32 {
 }
 
 #[inline(always)]
-fn assert_valid_block_size(block: usize) {
-    debug_assert!(block >= CHUNK_LEN);
-    debug_assert!(block.is_power_of_two());
-    debug_assert!(block.is_multiple_of(CHUNK_LEN));
+fn assert_valid_slice_size(slice: usize) {
+    debug_assert!(slice >= CHUNK_LEN);
+    debug_assert!(slice.is_power_of_two());
+    debug_assert!(slice.is_multiple_of(CHUNK_LEN));
 }
 
 #[inline(always)]
@@ -93,7 +93,7 @@ pub extern "C" fn layout_out_ptr() -> usize {
 
 #[no_mangle]
 pub extern "C" fn layout_stacks_base() -> usize {
-    align_up(layout_out_ptr() + MAX_BLOCKS * CV_SIZE, ALIGN)
+    align_up(layout_out_ptr() + MAX_SLICES * CV_SIZE, ALIGN)
 }
 
 #[no_mangle]
@@ -108,8 +108,8 @@ pub extern "C" fn config_max_data() -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn config_min_block() -> u32 {
-    MIN_BLOCK as u32
+pub extern "C" fn config_min_slice() -> u32 {
+    MIN_SLICE as u32
 }
 
 #[no_mangle]
@@ -118,8 +118,8 @@ pub extern "C" fn config_max_threads() -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn config_max_blocks() -> u32 {
-    MAX_BLOCKS as u32
+pub extern "C" fn config_max_slices() -> u32 {
+    MAX_SLICES as u32
 }
 
 #[no_mangle]
@@ -204,26 +204,26 @@ pub unsafe extern "C" fn worker_loop(
             continue;
         }
 
-        let chunk = at(c, CHUNK).load(Ordering::Relaxed) as usize;
+        let slice_size = at(c, SLICE_SIZE).load(Ordering::Relaxed) as usize;
         let total = at(c, TOTAL_LEN).load(Ordering::Relaxed) as usize;
 
         // Caller is lane 0.
         // Workers are lanes 1..=active.
         let lanes = active + 1;
-        let mut block = worker_lane + 1;
+        let mut slice = worker_lane + 1;
 
-        while block * chunk < total {
-            let offset = block * chunk;
-            let block_len = core::cmp::min(chunk, total - offset);
+        while slice * slice_size < total {
+            let offset = slice * slice_size;
+            let slice_len = core::cmp::min(slice_size, total - offset);
 
             hash_subtree_cv_at(
                 data.add(offset),
-                block_len,
+                slice_len,
                 offset as u64,
-                cv.add(block * CV_SIZE),
+                cv.add(slice * CV_SIZE),
             );
 
-            block += lanes;
+            slice += lanes;
         }
 
         if at(c, DONE).fetch_add(1, Ordering::AcqRel) == active as i32 - 1 {
@@ -244,7 +244,7 @@ pub unsafe extern "C" fn dispatch(
     len: u32,
     cv: *mut u8,
     workers: u32,
-    min_block: u32,
+    min_slice: u32,
 ) -> u32 {
     let total = len as usize;
 
@@ -255,22 +255,22 @@ pub unsafe extern "C" fn dispatch(
 
     let target_lanes = workers + 1;
 
-    let mut chunk = floor_pow2(len / target_lanes) as usize;
-    if chunk < min_block as usize {
-        chunk = min_block as usize;
+    let mut slice_size = floor_pow2(len / target_lanes) as usize;
+    if slice_size < min_slice as usize {
+        slice_size = min_slice as usize;
     }
 
-    assert_valid_block_size(chunk);
+    assert_valid_slice_size(slice_size);
 
-    let num_blocks = total.div_ceil(chunk);
-    if num_blocks < 2 {
+    let num_slices = total.div_ceil(slice_size);
+    if num_slices < 2 {
         blake3_hash(data, total, cv);
         return 0;
     }
 
-    let active = core::cmp::min(workers as usize, num_blocks - 1);
+    let active = core::cmp::min(workers as usize, num_slices - 1);
 
-    at(c, CHUNK).store(chunk as i32, Ordering::Relaxed);
+    at(c, SLICE_SIZE).store(slice_size as i32, Ordering::Relaxed);
     at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
     at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
     at(c, DONE).store(0, Ordering::Relaxed);
@@ -280,27 +280,27 @@ pub unsafe extern "C" fn dispatch(
 
     // Caller = lane 0
     let lanes = active + 1;
-    let mut block = 0usize;
+    let mut slice = 0usize;
 
-    while block < num_blocks {
-        let offset = block * chunk;
-        let block_len = core::cmp::min(chunk, total - offset);
+    while slice < num_slices {
+        let offset = slice * slice_size;
+        let slice_len = core::cmp::min(slice_size, total - offset);
 
         hash_subtree_cv_at(
             data.add(offset),
-            block_len,
+            slice_len,
             offset as u64,
-            cv.add(block * CV_SIZE),
+            cv.add(slice * CV_SIZE),
         );
 
-        block += lanes;
+        slice += lanes;
     }
 
     if active == 0 {
         at(c, SIGNAL).store(gen, Ordering::Release);
     }
 
-    num_blocks as u32
+    num_slices as u32
 }
 
 /// Merge subtree CVs into one root hash.
@@ -309,9 +309,9 @@ pub unsafe extern "C" fn dispatch(
 pub unsafe extern "C" fn merge_cv_tree(cv_ptr: *mut u8, count: u32, out_ptr: *mut u8) {
     let n = count as usize;
     debug_assert!(n >= 2);
-    debug_assert!(n <= MAX_BLOCKS);
+    debug_assert!(n <= MAX_SLICES);
 
-    let mut cvs = [[0u8; 32]; MAX_BLOCKS];
+    let mut cvs = [[0u8; 32]; MAX_SLICES];
 
     for i in 0..n {
         ptr::copy_nonoverlapping(cv_ptr.add(i * CV_SIZE), cvs[i].as_mut_ptr(), CV_SIZE);

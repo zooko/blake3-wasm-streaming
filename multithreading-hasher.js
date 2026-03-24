@@ -87,7 +87,7 @@ async function init() {
 
   const maxData = wasm.config_max_data();
   const maxThreads = wasm.config_max_threads();
-  const minBlock = wasm.config_min_block();
+  const minSlice = wasm.config_min_slice();
   const ctrlWords = wasm.config_ctrl_words();
   const stackSize = wasm.config_stack_size();
 
@@ -162,7 +162,7 @@ async function init() {
         len,
         outPtr,
         bgWorkers,
-        minBlock,
+        minSlice,
       );
 
       if (totalCvs >= 2) {

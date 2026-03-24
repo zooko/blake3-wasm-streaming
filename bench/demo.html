@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>BLAKE3 WASM — Hash Demo</title>
+  </head>
+  <body>
+    <pre id="out">Loading…</pre>
+    <script src="coi-serviceworker.min.js"></script>
+    <script type="module">
+     import hasher from '../multithreading-hasher.js';
+
+     const h = await hasher;
+
+     const smallInput = 'abcdefghihjl';
+     const largeInput = 'abcdefghihjl'.repeat(20000);
+
+     const smallSync = h.hash(smallInput);
+     const smallAsync = await h.hashParallel(smallInput);
+
+     const largeSync = h.hash(largeInput);
+     const largeAsync = await h.hashParallel(largeInput);
+
+     document.getElementById('out').textContent =
+       `max threads: ${h.maxThreads}\n\n` +
+       `small input: ${smallInput}\n` +
+       `small sync:  ${smallSync}\n` +
+       `small async: ${smallAsync}\n\n` +
+       `large input length: ${largeInput.length} bytes\n` +
+       `large sync:  ${largeSync}\n` +
+       `large async: ${largeAsync}\n`;
+    </script>
+  </body>
+</html>
