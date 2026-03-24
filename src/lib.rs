@@ -1,29 +1,160 @@
 #![feature(link_llvm_intrinsics)]
-use core::{ptr, slice};
-use blake3::hazmat::{HasherExt, merge_subtrees_non_root, merge_subtrees_root, Mode};
+
+use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, HasherExt, Mode};
+use core::{
+    mem,
+    ptr, slice,
+    sync::atomic::{AtomicI32, Ordering},
+};
 
 const CHUNK_LEN: usize = 1024;
 const CV_SIZE: usize = 32;
 
+// Public runtime/layout config.
+const MAX_DATA: usize = 2_000_000;
+const MIN_BLOCK: usize = 64 * 1024;
+const MAX_THREADS: usize = 4; // total lanes including caller
+const BG_WORKERS: usize = MAX_THREADS - 1;
+const MAX_BLOCKS: usize = (MAX_DATA + MIN_BLOCK - 1) / MIN_BLOCK;
+
+const ALIGN: usize = 16;
+const PAGE: usize = 65536;
+const STACK_SIZE: usize = 65536;
+
+// ctrl layout: 7 × i32 in shared WASM memory
+const CTRL_WORDS: usize = 7;
+const CTRL_BYTES: usize = CTRL_WORDS * mem::size_of::<i32>();
+
+const GEN: usize = 0;
+const CHUNK: usize = 1;
+const ACTIVE: usize = 2; // active background workers, not counting caller
+const DONE: usize = 3;
+const SIGNAL: usize = 4;
+const TOTAL_LEN: usize = 5;
+const READY: usize = 6;
+
+unsafe extern "C" {
+    #[link_name = "llvm.wasm.memory.atomic.wait32"]
+    fn atomic_wait(ptr: *mut i32, exp: i32, timeout: i64) -> i32;
+
+    #[link_name = "llvm.wasm.memory.atomic.notify"]
+    fn atomic_notify(ptr: *mut i32, count: u32) -> u32;
+
+    static __heap_base: u8;
+}
+
+#[inline(always)]
+const fn align_up(x: usize, a: usize) -> usize {
+    (x + a - 1) & !(a - 1)
+}
+
+#[inline(always)]
+fn heap_base() -> usize {
+    unsafe { (&__heap_base as *const u8) as usize }
+}
+
+#[inline(always)]
+unsafe fn at(c: *mut i32, i: usize) -> &'static AtomicI32 {
+    &*(c.add(i) as *const AtomicI32)
+}
+
 #[inline(always)]
 fn assert_valid_block_size(block: usize) {
+    debug_assert!(block >= CHUNK_LEN);
     debug_assert!(block.is_power_of_two());
     debug_assert!(block.is_multiple_of(CHUNK_LEN));
 }
 
+#[inline(always)]
+fn floor_pow2(n: u32) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        1 << (31 - n.leading_zeros())
+    }
+}
+
+// ── Layout/config exports ───────────────────────────────────
+
+#[no_mangle]
+pub extern "C" fn layout_ctrl_ptr() -> usize {
+    align_up(heap_base(), ALIGN)
+}
+
+#[no_mangle]
+pub extern "C" fn layout_data_ptr() -> usize {
+    align_up(layout_ctrl_ptr() + CTRL_BYTES, ALIGN)
+}
+
+#[no_mangle]
+pub extern "C" fn layout_out_ptr() -> usize {
+    align_up(layout_data_ptr() + MAX_DATA, ALIGN)
+}
+
+#[no_mangle]
+pub extern "C" fn layout_stacks_base() -> usize {
+    align_up(layout_out_ptr() + MAX_BLOCKS * CV_SIZE, ALIGN)
+}
+
+#[no_mangle]
+pub extern "C" fn layout_required_pages() -> usize {
+    let end = layout_stacks_base() + BG_WORKERS * STACK_SIZE;
+    (end + PAGE - 1) / PAGE
+}
+
+#[no_mangle]
+pub extern "C" fn config_max_data() -> u32 {
+    MAX_DATA as u32
+}
+
+#[no_mangle]
+pub extern "C" fn config_min_block() -> u32 {
+    MIN_BLOCK as u32
+}
+
+#[no_mangle]
+pub extern "C" fn config_max_threads() -> u32 {
+    MAX_THREADS as u32
+}
+
+#[no_mangle]
+pub extern "C" fn config_max_blocks() -> u32 {
+    MAX_BLOCKS as u32
+}
+
+#[no_mangle]
+pub extern "C" fn config_ctrl_words() -> u32 {
+    CTRL_WORDS as u32
+}
+
+#[no_mangle]
+pub extern "C" fn config_stack_size() -> u32 {
+    STACK_SIZE as u32
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn clear_ctrl(ctrl_ptr: *mut i32) {
+    ptr::write_bytes(ctrl_ptr, 0, CTRL_WORDS);
+}
+
+// ── Single-threaded full hash ───────────────────────────────
+
 #[no_mangle]
 pub unsafe extern "C" fn blake3_hash(data_ptr: *const u8, data_len: usize, out_ptr: *mut u8) {
-    let data = core::slice::from_raw_parts(data_ptr, data_len);
+    let data = slice::from_raw_parts(data_ptr, data_len);
     let hash = blake3::hash(data);
-    core::slice::from_raw_parts_mut(out_ptr, CV_SIZE).copy_from_slice(hash.as_bytes());
+    ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), out_ptr, CV_SIZE);
 }
+
+// ── Subtree hashing ─────────────────────────────────────────
 
 unsafe fn hash_subtree_cv_at(data: *const u8, len: usize, offset: u64, out: *mut u8) {
     debug_assert!(offset.is_multiple_of(CHUNK_LEN as u64));
 
     let input = slice::from_raw_parts(data, len);
     let mut hasher = blake3::Hasher::new();
-    if offset > 0 {
+
+    if offset != 0 {
         if let Some(max) = blake3::hazmat::max_subtree_len(offset) {
             debug_assert!(
                 len as u64 <= max,
@@ -33,91 +164,98 @@ unsafe fn hash_subtree_cv_at(data: *const u8, len: usize, offset: u64, out: *mut
                 max,
             );
         }
-
         hasher.set_input_offset(offset);
     }
+
     hasher.update(input);
     let cv = hasher.finalize_non_root();
-    ptr::copy_nonoverlapping(cv.as_ptr(), out, 32);
+    ptr::copy_nonoverlapping(cv.as_ptr(), out, CV_SIZE);
 }
 
-use core::sync::atomic::{AtomicI32, Ordering};
-
-extern "C" {
-    #[link_name = "llvm.wasm.memory.atomic.wait32"]
-    fn atomic_wait(ptr: *mut i32, exp: i32, timeout: i64) -> i32;
-    #[link_name = "llvm.wasm.memory.atomic.notify"]
-    fn atomic_notify(ptr: *mut i32, count: u32) -> u32;
-}
-
-// ctrl layout: 5 × i32 in shared WASM memory
-const GEN: usize = 0;
-const CHUNK: usize = 1;
-const ACTIVE: usize = 2;
-const DONE: usize = 3;
-const SIGNAL: usize = 4;
-
-#[inline(always)]
-unsafe fn at(c: *mut i32, i: usize) -> &'static AtomicI32 {
-    &*(c.add(i) as *const AtomicI32)
-}
-
-fn floor_pow2(n: u32) -> u32 {
-    if n == 0 { 0 } else { 1 << (31 - n.leading_zeros()) }
-}
-
-/// Blocking worker loop. Called once per Web Worker, blocks until GEN == -1.
+/// Background worker loop.
+/// Called once from each Web Worker and then blocks forever waiting on GEN.
 #[no_mangle]
 pub unsafe extern "C" fn worker_loop(
-    c: *mut i32, index: u32, data: *const u8, cv: *mut u8,
+    c: *mut i32,
+    index: u32,
+    data: *const u8,
+    cv: *mut u8,
 ) {
-    let mut last: i32 = 0;
+    at(c, READY).fetch_add(1, Ordering::AcqRel);
+    atomic_notify(c.add(READY), 1);
+
+    let mut last = at(c, GEN).load(Ordering::Acquire);
+
     loop {
         atomic_wait(c.add(GEN), last, -1);
+
         let gen = at(c, GEN).load(Ordering::Acquire);
         if gen < 0 {
             return;
         }
+        if gen == last {
+            continue;
+        }
         last = gen;
 
-        let act = at(c, ACTIVE).load(Ordering::Relaxed) as usize;
-        if index as usize >= act {
+        let active = at(c, ACTIVE).load(Ordering::Relaxed) as usize;
+        let worker_lane = index as usize;
+        if worker_lane >= active {
             continue;
         }
 
         let chunk = at(c, CHUNK).load(Ordering::Relaxed) as usize;
-        let i = index as usize;
-        let offset = i * chunk;
+        let total = at(c, TOTAL_LEN).load(Ordering::Relaxed) as usize;
 
-        hash_subtree_cv_at(
-            data.add(offset),
-            chunk,
-            offset as u64,
-            cv.add(i * CV_SIZE),
-        );
+        // Caller is lane 0.
+        // Workers are lanes 1..=active.
+        let lanes = active + 1;
+        let mut block = worker_lane + 1;
 
-        if at(c, DONE).fetch_add(1, Ordering::AcqRel) == act as i32 - 1 {
+        while block * chunk < total {
+            let offset = block * chunk;
+            let block_len = core::cmp::min(chunk, total - offset);
+
+            hash_subtree_cv_at(
+                data.add(offset),
+                block_len,
+                offset as u64,
+                cv.add(block * CV_SIZE),
+            );
+
+            block += lanes;
+        }
+
+        if at(c, DONE).fetch_add(1, Ordering::AcqRel) == active as i32 - 1 {
             at(c, SIGNAL).store(gen, Ordering::Release);
             atomic_notify(c.add(SIGNAL), 1);
         }
     }
 }
 
-/// Dispatch parallel hash. Wakes workers, hashes tail on caller.
-/// Returns active worker count (0 = single-thread fallback, already done).
+/// Dispatch a parallel hash job.
+/// `workers` means background workers only; caller is an extra lane.
+/// Returns number of subtree CVs written.
+/// Returns 0 if it fell back to single-threaded hashing.
 #[no_mangle]
 pub unsafe extern "C" fn dispatch(
-    c: *mut i32, data: *const u8, len: u32, cv: *mut u8,
-    workers: u32, min_block: u32,
+    c: *mut i32,
+    data: *const u8,
+    len: u32,
+    cv: *mut u8,
+    workers: u32,
+    min_block: u32,
 ) -> u32 {
+    let total = len as usize;
+
     if workers == 0 {
-        blake3_hash(data, len as usize, cv);
+        blake3_hash(data, total, cv);
         return 0;
     }
 
-    let total = len as usize;
+    let target_lanes = workers + 1;
 
-    let mut chunk = floor_pow2(len / workers) as usize;
+    let mut chunk = floor_pow2(len / target_lanes) as usize;
     if chunk < min_block as usize {
         chunk = min_block as usize;
     }
@@ -125,111 +263,75 @@ pub unsafe extern "C" fn dispatch(
     assert_valid_block_size(chunk);
 
     let num_blocks = total.div_ceil(chunk);
-
     if num_blocks < 2 {
         blake3_hash(data, total, cv);
         return 0;
     }
 
-    let active = core::cmp::min(workers as usize, num_blocks);
+    let active = core::cmp::min(workers as usize, num_blocks - 1);
 
     at(c, CHUNK).store(chunk as i32, Ordering::Relaxed);
     at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
+    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
     at(c, DONE).store(0, Ordering::Relaxed);
-    at(c, GEN).fetch_add(1, Ordering::Release);
+
+    let gen = at(c, GEN).fetch_add(1, Ordering::AcqRel) + 1;
     atomic_notify(c.add(GEN), u32::MAX);
 
-    // Caller hashes remaining blocks one-by-one.
-    let mut offset = active * chunk;
-    let mut cv_idx = active;
+    // Caller = lane 0
+    let lanes = active + 1;
+    let mut block = 0usize;
 
-    while offset < total {
+    while block < num_blocks {
+        let offset = block * chunk;
         let block_len = core::cmp::min(chunk, total - offset);
+
         hash_subtree_cv_at(
             data.add(offset),
             block_len,
             offset as u64,
-            cv.add(cv_idx * CV_SIZE),
+            cv.add(block * CV_SIZE),
         );
-        offset += chunk;
-        cv_idx += 1;
+
+        block += lanes;
     }
 
-    cv_idx as u32
+    if active == 0 {
+        at(c, SIGNAL).store(gen, Ordering::Release);
+    }
+
+    num_blocks as u32
 }
 
-/// Same split/merge as dispatch, but all on the caller thread (no workers).
-#[no_mangle]
-pub unsafe extern "C" fn dispatch_st(
-    data: *const u8, len: u32, cv: *mut u8,
-    workers: u32, min_block: u32,
-) -> u32 {
-    if workers == 0 {
-        blake3_hash(data, len as usize, cv);
-        return 0;
-    }
-
-    let total = len as usize;
-
-    let mut chunk = floor_pow2(len / workers) as usize;
-    if chunk < min_block as usize {
-        chunk = min_block as usize;
-    }
-
-    assert_valid_block_size(chunk);
-
-    let num_blocks = total.div_ceil(chunk);
-
-    if num_blocks < 2 {
-        blake3_hash(data, total, cv);
-        return 0;
-    }
-
-    let mut offset = 0usize;
-    let mut cv_idx = 0usize;
-
-    while offset < total {
-        let block_len = core::cmp::min(chunk, total - offset);
-        hash_subtree_cv_at(
-            data.add(offset),
-            block_len,
-            offset as u64,
-            cv.add(cv_idx * CV_SIZE),
-        );
-        offset += chunk;
-        cv_idx += 1;
-    }
-
-    cv_idx as u32
-}
-
-/// Merge an array of subtree chaining values into a single root hash.
-/// Called from JS after all workers have finished writing their CVs.
+/// Merge subtree CVs into one root hash.
+/// Assumes CVs are laid out in left-to-right subtree order.
 #[no_mangle]
 pub unsafe extern "C" fn merge_cv_tree(cv_ptr: *mut u8, count: u32, out_ptr: *mut u8) {
     let n = count as usize;
     debug_assert!(n >= 2);
+    debug_assert!(n <= MAX_BLOCKS);
 
-    // Copy CVs to local storage so we can merge in-place
-    let mut cvs = [[0u8; 32]; 257]; // max 256 workers + 1 tail
+    let mut cvs = [[0u8; 32]; MAX_BLOCKS];
+
     for i in 0..n {
-        ptr::copy_nonoverlapping(cv_ptr.add(i * 32), cvs[i].as_mut_ptr(), 32);
+        ptr::copy_nonoverlapping(cv_ptr.add(i * CV_SIZE), cvs[i].as_mut_ptr(), CV_SIZE);
     }
 
-    // Layer-by-layer pairwise merge (matches BLAKE3 tree structure
-    // for equal-sized power-of-two subtrees)
     let mut len = n;
     while len > 2 {
         let half = len / 2;
+
         for i in 0..half {
             cvs[i] = merge_subtrees_non_root(&cvs[2 * i], &cvs[2 * i + 1], Mode::Hash);
         }
+
         if len % 2 == 1 {
             cvs[half] = cvs[len - 1];
         }
-        len = half + len % 2;
+
+        len = half + (len % 2);
     }
 
     let root = merge_subtrees_root(&cvs[0], &cvs[1], Mode::Hash);
-    ptr::copy_nonoverlapping(root.as_bytes().as_ptr(), out_ptr, 32);
+    ptr::copy_nonoverlapping(root.as_bytes().as_ptr(), out_ptr, CV_SIZE);
 }

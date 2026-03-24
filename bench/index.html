@@ -12,7 +12,7 @@
        max-width: 1400px;
        margin: 0 auto;
      }
-     h1, h2, h3 { color: #1d4ed8; }
+     h1, h2 { color: #1d4ed8; }
      table { border-collapse: collapse; margin: 10px 0; }
      th, td {
        border: 1px solid #d1d5db;
@@ -33,7 +33,12 @@
        padding: 10px;
        border: 1px solid #d1d5db;
      }
-     button { font-size: 16px; padding: 8px 20px; margin: 5px 5px 5px 0; cursor: pointer; }
+     button {
+       font-size: 16px;
+       padding: 8px 20px;
+       margin: 5px 5px 5px 0;
+       cursor: pointer;
+     }
      button:disabled { opacity: 0.4; cursor: default; }
      .err { color: #b91c1c; font-weight: bold; }
      .dim { color: #6b7280; font-size: 0.85em; }
@@ -44,25 +49,26 @@
     </style>
   </head>
   <body>
-
     <h1>BLAKE3 WASM — Zero-Allocation Benchmarks</h1>
-    <p>Pre-allocates data + output regions in shared WASM memory once.<br>
-      All benchmark iterations use pointer arithmetic only — zero calls to alloc.</p>
+    <p>
+      Shared WASM memory is allocated once.<br>
+      Workers are spawned once and reused for the page lifetime.<br>
+      Runtime signaling uses atomics; no per-job postMessage traffic.
+    </p>
     <p>Cores: <span id="cores"></span></p>
 
     <button id="btn-run" onclick="window.runBenchmarks(false)">Run Benchmarks</button>
-    <button id="btn-quick" onclick="window.runBenchmarks(true)">Quick Run (fewer measurements)</button>
+    <button id="btn-quick" onclick="window.runBenchmarks(true)">Quick Run</button>
+
     <div id="status"></div>
 
-    <h2>Main-Thread Benchmarks — BLAKE3 vs WebCrypto SHA-256 (1T)</h2>
+    <h2>Main-Thread Benchmarks — BLAKE3 vs WebCrypto SHA-256</h2>
     <div id="main-results"></div>
 
     <h2>Multithreading Benchmarks</h2>
     <p style="color:#888; font-size:13px;">
       Each cell: time/byte · ratio vs SHA-256.<br>
-      <span style="background:#dcfce7;padding:1px 6px;">Green</span> = BLAKE3 &gt;10% faster than SHA-256.
-      <span style="background:#fee2e2;padding:1px 6px;">Red</span> = SHA-256 &gt;10% faster than BLAKE3.
-      <span style="background:#f3f4f6;padding:1px 6px;color:#9ca3af;">Grey</span> = fell back to single-threaded (data too small for MIN_BLOCK).
+      Grey = single-thread fallback because the input was too small to split.
     </p>
     <div id="mt-results"></div>
 
@@ -70,74 +76,112 @@
 
     <script src="coi-serviceworker.min.js"></script>
     <script type="module">
-     import { Blake3Hasher } from '../multithreading-hasher.js';
-
-     // ═══ Configuration ═══
+     // ═══ Config ═══
      const DATA_SIZES = [
        64,
        1536,
-       24576,
-       98304,
+       16385,
+       98304,    // 96 KiB
        163840,   // 160 KiB
-       229376,   // 224 KiB
+       262208,   // 256 KiB + 64
        393216,   // 384 KiB
        2000000,
      ];
-     const MAX_DATA      = DATA_SIZES[DATA_SIZES.length - 1];
-     const CV_LEN        = 32;
-     const SIGNAL        = 4;          // index into ctrl i32 array
-     const MIN_BLOCK     = 128 * 1024;
-     const THREAD_COUNTS = [1, 2, 3, 4, 5];
-     const WASM_URL      = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
 
-     const MEAS_FULL  = 9;
-     const MEAS_QUICK = 5;
-
-     // ═══ Test Vectors ═══
-     const TEST_VECTORS = [
-       { bytes: 16 * 1024,       expected: 'd49d367e4b0011a34510a28a1eb0caeb3e51e77ff2d30136849454640fefefc1' },
-       { bytes: 256 * 1024,      expected: 'b7db553d6c87096cf988bc6550f37b3f5d5f95537dd18ece86c047f97e786282' },
-       { bytes: 1024 * 1024,     expected: '64479cf7293960210547db8d982359e0c4ce054525ed7086cf93030828fc0533' },
-       { bytes: 2 * 1024 * 1024, expected: null },
+     const VERIFY_SIZES = [
+       64,
+       16385,
+       163840,
+       393216,
+       2000000,
      ];
 
-     // ═══ DOM ═══
-     const logEl    = document.getElementById('log');
-     const statusEl = document.getElementById('status');
-     document.getElementById('cores').textContent = navigator.hardwareConcurrency || '?';
+     const MAX_REQUEST_BYTES = Math.max(...DATA_SIZES);
+     const CV_LEN = 32;
 
-     function log(msg)       { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
-     function setStatus(msg) { statusEl.textContent = msg; statusEl.className = ''; }
-     function setError(msg)  { statusEl.textContent = msg; statusEl.className = 'err'; }
-     function sleep(ms)      { return new Promise(r => setTimeout(r, ms)); }
-     function assert(cond, msg) { if (!cond) throw new Error(msg); }
+     const HW = navigator.hardwareConcurrency || 4;
+     let THREAD_COUNTS = [];
+
+     const WASM_URL = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
+     const WORKER_URL = new URL('../hash-worker.js', import.meta.url);
+
+     const PAGE = 65536;
+
+     let maxData = 0;
+     let maxBlocks = 0;
+     let maxThreads = 0;
+     let minBlock = 0;
+     let stackSize = 0;
+     let ctrlWords = 0;
+
+     const GEN = 0;
+     const CHUNK = 1;
+     const ACTIVE = 2;
+     const DONE = 3;
+     const SIGNAL = 4;
+     const TOTAL_LEN = 5;
+     const READY = 6;
+
+     const MEAS_FULL = 9;
+     const MEAS_QUICK = 5;
+
+     // ═══ DOM ═══
+     const logEl = document.getElementById('log');
+     const statusEl = document.getElementById('status');
+     document.getElementById('cores').textContent = HW;
+
+     function log(msg) {
+       logEl.textContent += msg + '\n';
+       logEl.scrollTop = logEl.scrollHeight;
+     }
+     function setStatus(msg) {
+       statusEl.textContent = msg;
+       statusEl.className = '';
+     }
+     function setError(msg) {
+       statusEl.textContent = msg;
+       statusEl.className = 'err';
+     }
+     function assert(cond, msg) {
+       if (!cond) throw new Error(msg);
+     }
+
+     function alignUp(x, a) {
+       return (x + a - 1) & ~(a - 1);
+     }
 
      function fmtSize(bytes) {
-       if (bytes >= 1048576) return `${bytes / 1048576} MiB`;
-       if (bytes >= 1024) return `${bytes / 1024} KiB`;
-       return `${bytes} B`;
+       if (bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)} MiB`;
+       if (bytes % 1024 === 0) return `${bytes / 1024} KiB`;
+       return `${bytes.toLocaleString()} B`;
      }
+
      function fmtMs(ms) {
-       if (ms >= 1)     return ms.toFixed(3) + ' ms';
+       if (ms >= 1) return ms.toFixed(3) + ' ms';
        if (ms >= 0.001) return (ms * 1000).toFixed(1) + ' µs';
        return (ms * 1e6).toFixed(0) + ' ns';
      }
+
      function fmtTimePerByte(ms, bytes) {
        const nsB = (ms * 1e6) / bytes;
        if (nsB >= 1000) return (nsB / 1000).toFixed(2) + ' µs/B';
-       if (nsB >= 1)    return nsB.toFixed(2) + ' ns/B';
+       if (nsB >= 1) return nsB.toFixed(2) + ' ns/B';
        return (nsB * 1000).toFixed(0) + ' ps/B';
      }
+
      function hex(buf) {
-       return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+       return Array.from(new Uint8Array(buf))
+                   .map(b => b.toString(16).padStart(2, '0'))
+                   .join('');
      }
+
      function cellClass(ratio) {
        if (ratio > 1.10) return 'cell-win';
        if (ratio < 0.90) return 'cell-lose';
        return '';
      }
 
-     // ═══ Calibrated measurement ═══
+     // ═══ Measurement helpers ═══
      function calibrateSync(fn, targetMs) {
        fn(); fn(); fn();
        const probe = 5;
@@ -182,135 +226,184 @@
        return { ms: times[Math.floor(times.length / 2)], iters };
      }
 
-     // ═══ Hasher state ═══
-     let hasher, sha256Data;
+     // ═══ WASM / shared state ═══
+     let wasmModule;
+     let wasmMemory;
+     let wasmExports;
+
+     let ctrlPtr;
+     let dataPtr;
+     let outPtr;
+     let stacksBase;
+
+     let ctrlI32;
+     let sha256Data;
+     let signalSeen = 0;
+     let workers = [];
+     let spawned = false;
 
      async function initWasm() {
-       hasher = await Blake3Hasher.create(WASM_URL, { maxData: MAX_DATA });
+       if (typeof Atomics.waitAsync !== 'function') {
+         throw new Error('Atomics.waitAsync is unavailable in this browser');
+       }
 
-       const heap = new Uint8Array(hasher._mem.buffer);
-       for (let i = 0; i < MAX_DATA; i++) heap[hasher._data + i] = i & 0xff;
+       const bytes = await (await fetch(WASM_URL)).arrayBuffer();
+       wasmModule = await WebAssembly.compile(bytes);
 
-       sha256Data = new Uint8Array(MAX_DATA);
-       sha256Data.set(heap.subarray(hasher._data, hasher._data + MAX_DATA));
+       wasmMemory = new WebAssembly.Memory({
+         initial: 512,
+         maximum: 65536,
+         shared: true,
+       });
 
-       log('Blake3Hasher created');
-       log(`  data @ ${hasher._data}  (${MAX_DATA} bytes)`);
-       log(`  out  @ ${hasher._out}`);
-       log(`  ctrl @ ${hasher._ctrl}`);
+       const inst = await WebAssembly.instantiate(wasmModule, {
+         env: { memory: wasmMemory },
+       });
+       wasmExports = inst.exports;
+
+       const needPages = wasmExports.layout_required_pages();
+       const havePages = wasmMemory.buffer.byteLength / PAGE;
+       if (needPages > havePages) {
+         wasmMemory.grow(needPages - havePages);
+       }
+
+       ctrlPtr = wasmExports.layout_ctrl_ptr();
+       dataPtr = wasmExports.layout_data_ptr();
+       outPtr = wasmExports.layout_out_ptr();
+       stacksBase = wasmExports.layout_stacks_base();
+
+       maxData = wasmExports.config_max_data();
+       maxBlocks = wasmExports.config_max_blocks();
+       maxThreads = wasmExports.config_max_threads();
+       minBlock = wasmExports.config_min_block();
+       ctrlWords = wasmExports.config_ctrl_words();
+       stackSize = wasmExports.config_stack_size();
+
+       assert(
+         MAX_REQUEST_BYTES <= maxData,
+         `benchmark wants ${MAX_REQUEST_BYTES} bytes but wasm maxData is ${maxData}`,
+       );
+
+       THREAD_COUNTS = Array.from(
+         { length: Math.min(maxThreads, HW) },
+         (_, i) => i + 1,
+       );
+
+       ctrlI32 = new Int32Array(wasmMemory.buffer, ctrlPtr, ctrlWords);
+       wasmExports.clear_ctrl(ctrlPtr);
+
+       const heap = new Uint8Array(wasmMemory.buffer);
+       for (let i = 0; i < MAX_REQUEST_BYTES; i++) {
+         heap[dataPtr + i] = i & 0xff;
+       }
+
+       sha256Data = new Uint8Array(MAX_REQUEST_BYTES);
+       sha256Data.set(heap.subarray(dataPtr, dataPtr + MAX_REQUEST_BYTES));
+
+       log('Shared WASM layout:');
+       log(`  ctrl        @ ${ctrlPtr} (${ctrlWords * 4} bytes)`);
+       log(`  data        @ ${dataPtr} (${maxData} bytes max)`);
+       log(`  out         @ ${outPtr} (${maxBlocks * CV_LEN} bytes)`);
+       log(`  stacks      @ ${stacksBase}`);
+       log(`  max threads @ ${maxThreads}`);
+       log(`  min block   @ ${minBlock} bytes`);
      }
 
-     // ═══ Hash primitives ═══
+     async function waitUntilAtLeast(idx, target) {
+       while (true) {
+         const cur = Atomics.load(ctrlI32, idx);
+         if (cur >= target) return;
+         const r = Atomics.waitAsync(ctrlI32, idx, cur);
+         if (r.async) await r.value;
+       }
+     }
 
+     async function waitForSignalChange(expected) {
+       const r = Atomics.waitAsync(ctrlI32, SIGNAL, expected);
+       if (r.async) await r.value;
+     }
+
+     async function spawnWorkers() {
+       if (spawned) return;
+
+       const bgWorkers = Math.max(...THREAD_COUNTS) - 1;
+       if (bgWorkers <= 0) {
+         spawned = true;
+         return;
+       }
+
+       Atomics.store(ctrlI32, READY, 0);
+
+       for (let i = 0; i < bgWorkers; i++) {
+         const w = new Worker(WORKER_URL, { type: 'module' });
+         w.postMessage({
+           wasmModule,
+           memory: wasmMemory,
+           index: i,
+           ctrlPtr,
+           dataPtr,
+           cvPtr: outPtr,
+           stacksBase,
+           stackSize,
+         });
+         workers.push(w);
+       }
+
+       await waitUntilAtLeast(READY, bgWorkers);
+       signalSeen = Atomics.load(ctrlI32, SIGNAL);
+       spawned = true;
+
+       log(`Spawned ${bgWorkers} background worker(s)`);
+     }
+
+     // ═══ Hashing ═══
      function hashBlake3(bytes) {
-       hasher._exp.blake3_hash(hasher._data, bytes, hasher._out);
+       wasmExports.blake3_hash(dataPtr, bytes, outPtr);
      }
 
-     function hashSplitST(bytes, nWorkers) {
-       const totalCvs = hasher._exp.dispatch_st(
-         hasher._data, bytes, hasher._out, nWorkers, MIN_BLOCK,
+     async function hashParallel(bytes, totalThreads) {
+       const bgWorkers = Math.max(0, totalThreads - 1);
+       const totalCvs = wasmExports.dispatch(
+         ctrlPtr,
+         dataPtr,
+         bytes,
+         outPtr,
+         bgWorkers,
+         minBlock,
        );
-       if (totalCvs >= 2) {
-         hasher._exp.merge_cv_tree(hasher._out, totalCvs, hasher._out);
-       }
-     }
 
-     async function hashParallel(bytes, nWorkers) {
-       const totalCvs = hasher._exp.dispatch(
-         hasher._ctrl, hasher._data, bytes, hasher._out, nWorkers, MIN_BLOCK,
-       );
        if (totalCvs >= 2) {
-         const r = Atomics.waitAsync(hasher._i32, SIGNAL, hasher._sig);
-         if (r.async) {
-           const timeout = new Promise((_, rej) =>
-             setTimeout(() => rej(new Error(
-               `MT timeout (${nWorkers}W, ${fmtSize(bytes)}, cvs=${totalCvs})`)), 3000));
-           await Promise.race([r.value, timeout]);
-         }
-         hasher._sig = Atomics.load(hasher._i32, SIGNAL);
-         hasher._exp.merge_cv_tree(hasher._out, totalCvs, hasher._out);
+         const expected = signalSeen;
+         await waitForSignalChange(expected);
+         signalSeen = Atomics.load(ctrlI32, SIGNAL);
+         wasmExports.merge_cv_tree(outPtr, totalCvs, outPtr);
        }
+
        return totalCvs;
      }
 
-     // Spawn one worker pool with clean shared-memory state.
-     // For this diagnostic test, call this ONCE only, before any MT benchmarks.
-     async function spawnClean(nWorkers) {
-       //xxx clearing these control words is unnecessary rremove this after testing
-       Atomics.store(hasher._i32, 0, 0); // GEN
-       Atomics.store(hasher._i32, 1, 0); // CHUNK
-       Atomics.store(hasher._i32, 2, 0); // ACTIVE
-       Atomics.store(hasher._i32, 3, 0); // DONE
-       Atomics.store(hasher._i32, 4, 0); // SIGNAL
-       await hasher._spawn(nWorkers);
-       hasher._sig = Atomics.load(hasher._i32, SIGNAL);
-       await sleep(100); // let workers enter wait loops
+     function readDigestHex() {
+       return hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
      }
 
-     // ═══ Populate benchmarks ═══
-     function populateBufferDirect(bytes) {
-       const heap = new Uint8Array(hasher._mem.buffer);
-       for (let i = 0; i < bytes; i++) heap[hasher._data + i] = i & 0xff;
-     }
+     async function verifyMtCorrectness(totalThreads, bytes) {
+       hashBlake3(bytes);
+       const ref = readDigestHex();
 
-     function populateViaStaging(bytes) {
-       for (let i = 0; i < bytes; i++) sha256Data[i] = i & 0xff;
-       new Uint8Array(hasher._mem.buffer, hasher._data, bytes).set(sha256Data.subarray(0, bytes));
-     }
+       await hashParallel(bytes, totalThreads);
+       const got = readDigestHex();
 
-     function populateBulkOnly(bytes) {
-       new Uint8Array(hasher._mem.buffer, hasher._data, bytes).set(sha256Data.subarray(0, bytes));
-     }
-
-     // ═══ Verification ═══
-
-     function verifyTestVectors() {
-       log('');
-       log('── BLAKE3 test vector verification ──');
-       let allPassed = true, anyNull = false;
-       for (const v of TEST_VECTORS) {
-         assert(v.bytes <= MAX_DATA, `test size ${fmtSize(v.bytes)} exceeds MAX_DATA`);
-         hashBlake3(v.bytes);
-         const got = hex(new Uint8Array(hasher._mem.buffer, hasher._out, CV_LEN));
-         if (v.expected === null) {
-           log(`  ${fmtSize(v.bytes).padStart(8)}  ${got}  ← paste as expected`);
-           anyNull = true;
-         } else if (got === v.expected) {
-           log(`  ${fmtSize(v.bytes).padStart(8)}  ✓`);
-         } else {
-           log(`  ${fmtSize(v.bytes).padStart(8)}  ✗ MISMATCH`);
-           log(`    expected: ${v.expected}`);
-           log(`    got:      ${got}`);
-           allPassed = false;
-         }
-       }
-       if (!allPassed) throw new Error('BLAKE3 test vector mismatch — see log');
-       if (anyNull) log('  (paste logged hex values into TEST_VECTORS to enable assertions)');
-       else log('  All test vectors passed ✓');
-     }
-
-     async function verifyMtCorrectness(nWorkers) {
-       // Reference: main-thread hash of full data
-       hashBlake3(MAX_DATA);
-       const ref = hex(new Uint8Array(hasher._mem.buffer, hasher._out, CV_LEN));
-
-       // Parallel hash
-       await hashParallel(MAX_DATA, nWorkers);
-       const par = hex(new Uint8Array(hasher._mem.buffer, hasher._out, CV_LEN));
-
-       assert(ref === par,
-              `${nWorkers}W hash mismatch\n  ref: ${ref.slice(0, 32)}…\n  par: ${par.slice(0, 32)}…`);
+       assert(
+         ref === got,
+         `${totalThreads}T mismatch at ${fmtSize(bytes)}\nref=${ref}\ngot=${got}`,
+       );
      }
 
      // ═══ Rendering ═══
-
      function renderMainTable(rows) {
        let html = `<table>
          <tr>
            <th>Data Size</th>
-           <th>popBuf (write SAB)</th>
-           <th>popAB+copy (AB→SAB)</th>
-           <th>popSet (→SAB)</th>
            <th>BLAKE3 (1T)</th>
            <th>BLAKE3 Time/byte</th>
            <th>SHA-256 (WebCrypto)</th>
@@ -318,21 +411,20 @@
            <th>BLAKE3 vs SHA-256</th>
            <th>Iters</th>
          </tr>`;
+
        for (const r of rows) {
          const ratio = r.shaMs / r.b3Ms;
          html += `<tr>
-           <td>${r.sizeLabel}</td>
-           <td>${fmtMs(r.popBufMs)}</td>
-           <td>${fmtMs(r.popABMs)}</td>
-           <td>${fmtMs(r.popSetMs)}</td>
-           <td>${fmtMs(r.b3Ms)}</td>
-           <td><b>${fmtTimePerByte(r.b3Ms, r.bytes)}</b></td>
-           <td>${fmtMs(r.shaMs)}</td>
-           <td><b>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
-           <td class="${cellClass(ratio)}"><b>${ratio.toFixed(2)}×</b></td>
-           <td class="dim">${r.popBufIters} / ${r.popABIters} / ${r.popSetIters} / ${r.b3Iters} / ${r.shaIters}</td>
-         </tr>`;
+            <td>${r.sizeLabel}</td>
+            <td>${fmtMs(r.b3Ms)}</td>
+            <td><b>${fmtTimePerByte(r.b3Ms, r.bytes)}</b></td>
+            <td>${fmtMs(r.shaMs)}</td>
+            <td><b>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
+            <td class="${cellClass(ratio)}"><b>${ratio.toFixed(2)}×</b></td>
+            <td class="dim">${r.b3Iters} / ${r.shaIters}</td>
+          </tr>`;
        }
+
        html += '</table>';
        document.getElementById('main-results').innerHTML = html;
      }
@@ -353,105 +445,93 @@
            } else if (cell.err) {
              html += `<td class="err" title="${cell.err}">❌</td>`;
            } else if (cell.skip) {
-             html += `<td class="cell-fallback"><span class="dim">=${cell.effectiveT}T</span></td>`;
+             html += `<td class="cell-fallback"><span class="dim">=1T</span></td>`;
            } else {
              const ratio = shaBaseline[si] / cell.ms;
              html += `<td class="${cellClass(ratio)}">${fmtTimePerByte(cell.ms, bytes)}<br>`
-                   + `<span class="dim">${ratio.toFixed(2)}× vs SHA</span></td>`;
+                   + `<span class="dim">${ratio.toFixed(2)}× vs SHA</span><br>`
+                   + `<span class="dim">${cell.cvs} CV</span></td>`;
            }
          }
+
          html += '</tr>';
        }
+
        html += '</table>';
        document.getElementById('mt-results').innerHTML = html;
      }
 
-     // ═══ Main benchmark runner ═══
+     // ═══ Main runner ═══
      async function runBenchmarks(quick = false) {
-       const btnRun   = document.getElementById('btn-run');
+       const btnRun = document.getElementById('btn-run');
        const btnQuick = document.getElementById('btn-quick');
        const targetMs = quick ? 40 : 200;
+       const numM = quick ? MEAS_QUICK : MEAS_FULL;
+
        btnRun.disabled = btnQuick.disabled = true;
        logEl.textContent = '';
        document.getElementById('main-results').innerHTML = '';
        document.getElementById('mt-results').innerHTML = '';
 
-       const numM = quick ? MEAS_QUICK : MEAS_FULL;
-
        try {
          setStatus('Loading WASM…');
          await initWasm();
 
-         verifyTestVectors();
+         setStatus('Spawning workers…');
+         await spawnWorkers();
 
-         // Verify split+merge logic (single-thread, no workers)
          log('');
-         log('── Split+merge verification (single-thread) ──');
-         for (const nw of [2, 3, 4, 5, 6]) {
-           hashBlake3(MAX_DATA);
-           const ref = hex(new Uint8Array(hasher._mem.buffer, hasher._out, CV_LEN));
-           hashSplitST(MAX_DATA, nw);
-           const got = hex(new Uint8Array(hasher._mem.buffer, hasher._out, CV_LEN));
-           assert(ref === got,
-                  `ST split ${nw}W mismatch\n  ref: ${ref}\n  got: ${got}`);
-           log(`  ✓ ${nw}W split+merge matches blake3::hash`);
+         log('── Multithreaded correctness verification ──');
+         for (const t of THREAD_COUNTS) {
+           if (t === 1) continue;
+           for (const bytes of VERIFY_SIZES) {
+             await verifyMtCorrectness(t, bytes);
+             log(`  ✓ ${t}T ${fmtSize(bytes)}`);
+           }
          }
 
-         log('');
-         log('── Benchmarks (zero-allocation from here) ──');
          setStatus('Running main-thread benchmarks…');
-         await sleep(50);
 
-         // ── Main-thread benchmarks ──
-         const mainRows    = [];
-         const b3Baseline  = [];
+         const mainRows = [];
+         const b3Baseline = [];
          const shaBaseline = [];
 
          for (const bytes of DATA_SIZES) {
            const sizeLabel = fmtSize(bytes);
-           const shaView   = sha256Data.subarray(0, bytes);
+           const shaView = sha256Data.subarray(0, bytes);
 
-           const popBuf = measureSync(() => populateBufferDirect(bytes), numM, targetMs);
-           const popAB  = measureSync(() => populateViaStaging(bytes),   numM, targetMs);
-           const popSet = measureSync(() => populateBulkOnly(bytes),     numM, targetMs);
-           const b3     = measureSync(() => hashBlake3(bytes),           numM, targetMs);
-           const sha    = await measureAsync(
-             () => crypto.subtle.digest('SHA-256', shaView), numM, targetMs
+           const b3 = measureSync(() => hashBlake3(bytes), numM, targetMs);
+           const sha = await measureAsync(
+             () => crypto.subtle.digest('SHA-256', shaView),
+             numM,
+             targetMs,
            );
 
            b3Baseline.push(b3.ms);
            shaBaseline.push(sha.ms);
            mainRows.push({
-             sizeLabel, bytes,
-             popBufMs: popBuf.ms, popBufIters: popBuf.iters,
-             popABMs:  popAB.ms,  popABIters:  popAB.iters,
-             popSetMs: popSet.ms, popSetIters: popSet.iters,
-             b3Ms:     b3.ms,     b3Iters:     b3.iters,
-             shaMs:    sha.ms,    shaIters:    sha.iters,
+             sizeLabel,
+             bytes,
+             b3Ms: b3.ms,
+             b3Iters: b3.iters,
+             shaMs: sha.ms,
+             shaIters: sha.iters,
            });
 
            const ratio = sha.ms / b3.ms;
            log(
-             `${sizeLabel.padStart(8)}` +
-             `  popBuf ${fmtMs(popBuf.ms).padStart(10)} (${popBuf.iters})` +
-             `  popAB ${fmtMs(popAB.ms).padStart(10)} (${popAB.iters})` +
-             `  popSet ${fmtMs(popSet.ms).padStart(10)} (${popSet.iters})` +
-             `  b3 ${fmtMs(b3.ms).padStart(10)} (${b3.iters})` +
-             `  ${fmtTimePerByte(b3.ms, bytes)}` +
-             `  sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters})` +
-             `  ${fmtTimePerByte(sha.ms, bytes)}` +
-             `  b3-vs-sha ${ratio.toFixed(2)}×`
+             `${sizeLabel.padStart(12)}`
+             + `  b3 ${fmtMs(b3.ms).padStart(10)} (${b3.iters})`
+             + `  ${fmtTimePerByte(b3.ms, bytes)}`
+             + `  sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters})`
+             + `  ${fmtTimePerByte(sha.ms, bytes)}`
+             + `  b3-vs-sha ${ratio.toFixed(2)}×`
            );
+
            renderMainTable(mainRows);
-           await sleep(1);
          }
 
-         // ── Multithreading benchmarks ──
-         setStatus('Multithreading benchmarks…');
-
-         // ── Spawn workers ──
-         const maxThreads = Math.max(...THREAD_COUNTS);
-         await spawnClean(maxThreads);
+         setStatus('Running multithreading benchmarks…');
 
          const matrix = DATA_SIZES.map(() => []);
 
@@ -459,58 +539,52 @@
            const tc = THREAD_COUNTS[ti];
 
            if (tc === 1) {
-             // 1T column: use main-thread baseline directly
              for (let si = 0; si < DATA_SIZES.length; si++) {
-               matrix[si][ti] = { ms: b3Baseline[si] };
+               matrix[si][ti] = { ms: b3Baseline[si], cvs: 1 };
              }
              renderMtTable(matrix, b3Baseline, shaBaseline);
              continue;
            }
 
-           // ── Verify correctness ──
-           await verifyMtCorrectness(tc);
-           log(`  ✓ ${tc}T correctness verified`);
-
-           // ── Benchmark each data size ──
            for (let si = 0; si < DATA_SIZES.length; si++) {
              const bytes = DATA_SIZES[si];
 
              try {
-               // Probe call: detect whether dispatch actually uses workers
-               const act = await hashParallel(bytes, tc);
+               const probeCvs = await hashParallel(bytes, tc);
 
-               if (act < 2) {
-                 matrix[si][ti] = { skip: true, effectiveT: 1 };
-                 log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T  → =1T`);
+               if (probeCvs < 2) {
+                 matrix[si][ti] = { skip: true };
+                 log(`  ${fmtSize(bytes).padStart(12)} × ${tc}T  -> =1T`);
                  continue;
                }
 
                const result = await measureAsync(
-                 () => hashParallel(bytes, tc), numM, targetMs
+                 () => hashParallel(bytes, tc),
+                 numM,
+                 targetMs,
                );
 
-               matrix[si][ti] = { ms: result.ms };
+               matrix[si][ti] = { ms: result.ms, cvs: probeCvs };
 
                const vsSha = shaBaseline[si] / result.ms;
-               const vs1T  = b3Baseline[si] / result.ms;
+               const vs1T = b3Baseline[si] / result.ms;
                log(
-                 `  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T` +
-                 `  ${fmtMs(result.ms).padStart(10)}  (${result.iters} iters)` +
-                 `  ${fmtTimePerByte(result.ms, bytes)}` +
-                 `  ${vsSha.toFixed(2)}× vs SHA` +
-                 `  ${vs1T.toFixed(2)}× vs 1T`
+                 `  ${fmtSize(bytes).padStart(12)} × ${tc}T`
+                 + `  ${fmtMs(result.ms).padStart(10)} (${result.iters})`
+                 + `  ${fmtTimePerByte(result.ms, bytes)}`
+                 + `  ${vsSha.toFixed(2)}× vs SHA`
+                 + `  ${vs1T.toFixed(2)}× vs 1T`
+                 + `  ${probeCvs} CV`
                );
              } catch (e) {
                matrix[si][ti] = { err: e.message || String(e) };
-               log(`  ${fmtSize(bytes).padStart(8)} × ${String(tc).padStart(2)}T  ❌ ${e.message}`);
+               log(`  ${fmtSize(bytes).padStart(12)} × ${tc}T  ❌ ${e.message || e}`);
              }
            }
 
            renderMtTable(matrix, b3Baseline, shaBaseline);
-           await sleep(10);
          }
 
-         hasher.terminate();
          setStatus('Done!');
          log('\n════ All benchmarks complete ════');
        } catch (e) {
