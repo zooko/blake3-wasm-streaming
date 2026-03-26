@@ -1,21 +1,36 @@
 #![feature(link_llvm_intrinsics)]
 
-use blake3::hazmat::{merge_subtrees_non_root, merge_subtrees_root, HasherExt, Mode};
+use blake3::hazmat::{
+    merge_subtrees_non_root,
+    merge_subtrees_root,
+    HasherExt,
+    Mode,
+};
 use core::{
     mem,
-    ptr, slice,
+    ptr,
+    slice,
     sync::atomic::{AtomicI32, Ordering},
 };
 
 const CHUNK_LEN: usize = 1024;
 const CV_SIZE: usize = 32;
 
-// Public runtime/layout config.
+// Runtime/layout config.
 const MAX_DATA: usize = 2_000_000;
-const MIN_SLICE: usize = 8 * 1024;
-const MAX_THREADS: usize = 4; // total lanes including caller
+
+// Total lanes including caller.
+const MAX_THREADS: usize = 4;
 const BG_WORKERS: usize = MAX_THREADS - 1;
-const MAX_SLICES: usize = (MAX_DATA + MIN_SLICE - 1) / MIN_SLICE;
+
+// Planner.
+const DIRECT_CUTOFF: usize = 96 * 1024;
+const SLICE_64K: usize = 64 * 1024;
+const SLICE_128K: usize = 128 * 1024;
+const SLICE_256K: usize = 256 * 1024;
+
+// At MAX_DATA with the planner below, this is enough.
+const MAX_SLICES: usize = 8;
 
 const ALIGN: usize = 16;
 const PAGE: usize = 65536;
@@ -59,19 +74,35 @@ unsafe fn at(c: *mut i32, i: usize) -> &'static AtomicI32 {
 }
 
 #[inline(always)]
-fn assert_valid_slice_size(slice: usize) {
-    debug_assert!(slice >= CHUNK_LEN);
-    debug_assert!(slice.is_power_of_two());
-    debug_assert!(slice.is_multiple_of(CHUNK_LEN));
+fn choose_plan(len: usize) -> (usize, usize) {
+    if len < DIRECT_CUTOFF {
+        return (0, 0);
+    }
+    if len < 256 * 1024 {
+        return (SLICE_64K, 1);
+    }
+    if len < 320 * 1024 {
+        return (SLICE_64K, 2);
+    }
+    if len < 384 * 1024 {
+        return (SLICE_64K, 3);
+    }
+    if len < 1024 * 1024 {
+        return (SLICE_128K, 2);
+    }
+    (SLICE_256K, 3)
 }
 
 #[inline(always)]
-fn floor_pow2(n: u32) -> u32 {
-    if n == 0 {
-        0
-    } else {
-        1 << (31 - n.leading_zeros())
-    }
+fn full_prefix_len(total: usize, slice_size: usize) -> usize {
+    total & !(slice_size - 1)
+}
+
+#[inline(always)]
+fn leaf_count(total: usize, slice_size: usize) -> usize {
+    let full = full_prefix_len(total, slice_size);
+    let tail = total - full;
+    (full / slice_size) + (tail != 0) as usize
 }
 
 // ── Layout/config exports ───────────────────────────────────
@@ -108,11 +139,6 @@ pub extern "C" fn config_max_data() -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn config_min_slice() -> u32 {
-    MIN_SLICE as u32
-}
-
-#[no_mangle]
 pub extern "C" fn config_max_threads() -> u32 {
     MAX_THREADS as u32
 }
@@ -146,24 +172,17 @@ pub unsafe extern "C" fn blake3_hash(data_ptr: *const u8, data_len: usize, out_p
     ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), out_ptr, CV_SIZE);
 }
 
-// ── Subtree hashing ─────────────────────────────────────────
+// ── Direct subtree-CV hashing for planner slices ────────────
 
-unsafe fn hash_subtree_cv_at(data: *const u8, len: usize, offset: u64, out: *mut u8) {
-    debug_assert!(offset.is_multiple_of(CHUNK_LEN as u64));
+#[inline(always)]
+unsafe fn hash_slice_cv_at(data: *const u8, len: usize, offset: u64, out: *mut u8) {
+    assert!(len != 0);
+    assert!(offset.is_multiple_of(CHUNK_LEN as u64));
 
     let input = slice::from_raw_parts(data, len);
     let mut hasher = blake3::Hasher::new();
 
     if offset != 0 {
-        if let Some(max) = blake3::hazmat::max_subtree_len(offset) {
-            debug_assert!(
-                len as u64 <= max,
-                "invalid subtree: offset={} len={} max={}",
-                offset,
-                len,
-                max,
-            );
-        }
         hasher.set_input_offset(offset);
     }
 
@@ -172,8 +191,43 @@ unsafe fn hash_subtree_cv_at(data: *const u8, len: usize, offset: u64, out: *mut
     ptr::copy_nonoverlapping(cv.as_ptr(), out, CV_SIZE);
 }
 
-/// Background worker loop.
-/// Called once from each Web Worker and then blocks forever waiting on GEN.
+#[inline(always)]
+unsafe fn process_lane(
+    lane: usize,
+    lanes: usize,
+    slice_size: usize,
+    total: usize,
+    data: *const u8,
+    cv: *mut u8,
+) {
+    let full = full_prefix_len(total, slice_size);
+    let num_full = full / slice_size;
+    let tail = total - full;
+
+    let mut slice = lane;
+    while slice < num_full {
+        let offset = slice * slice_size;
+        hash_slice_cv_at(
+            data.add(offset),
+            slice_size,
+            offset as u64,
+            cv.add(slice * CV_SIZE),
+        );
+        slice += lanes;
+    }
+
+    if tail != 0 && lane == (num_full % lanes) {
+        hash_slice_cv_at(
+            data.add(full),
+            tail,
+            full as u64,
+            cv.add(num_full * CV_SIZE),
+        );
+    }
+}
+
+// ── Worker loop ─────────────────────────────────────────────
+
 #[no_mangle]
 pub unsafe extern "C" fn worker_loop(
     c: *mut i32,
@@ -199,32 +253,20 @@ pub unsafe extern "C" fn worker_loop(
         last = gen;
 
         let active = at(c, ACTIVE).load(Ordering::Relaxed) as usize;
-        let worker_lane = index as usize;
-        if worker_lane >= active {
+        let lanes = active + 1;
+        let lane = index as usize + 1;
+
+        if lane >= lanes {
             continue;
         }
 
         let slice_size = at(c, SLICE_SIZE).load(Ordering::Relaxed) as usize;
         let total = at(c, TOTAL_LEN).load(Ordering::Relaxed) as usize;
 
-        // Caller is lane 0.
-        // Workers are lanes 1..=active.
-        let lanes = active + 1;
-        let mut slice = worker_lane + 1;
+        assert!(slice_size.is_power_of_two());
+        assert!(slice_size.is_multiple_of(CHUNK_LEN));
 
-        while slice * slice_size < total {
-            let offset = slice * slice_size;
-            let slice_len = core::cmp::min(slice_size, total - offset);
-
-            hash_subtree_cv_at(
-                data.add(offset),
-                slice_len,
-                offset as u64,
-                cv.add(slice * CV_SIZE),
-            );
-
-            slice += lanes;
-        }
+        process_lane(lane, lanes, slice_size, total, data, cv);
 
         if at(c, DONE).fetch_add(1, Ordering::AcqRel) == active as i32 - 1 {
             at(c, SIGNAL).store(gen, Ordering::Release);
@@ -233,105 +275,92 @@ pub unsafe extern "C" fn worker_loop(
     }
 }
 
-/// Dispatch a parallel hash job.
-/// `workers` means background workers only; caller is an extra lane.
-/// Returns number of subtree CVs written.
-/// Returns 0 if it fell back to single-threaded hashing.
+// ── Planner + dispatch ──────────────────────────────────────
+
 #[no_mangle]
-pub unsafe extern "C" fn dispatch(
+pub unsafe extern "C" fn dispatch_auto(
     c: *mut i32,
     data: *const u8,
     len: u32,
     cv: *mut u8,
-    workers: u32,
-    min_slice: u32,
 ) -> u32 {
     let total = len as usize;
+    assert!(total <= MAX_DATA);
 
-    if workers == 0 {
+    let (slice_size, wanted_bg_workers) = choose_plan(total);
+
+    if wanted_bg_workers == 0 {
+        at(c, SLICE_SIZE).store(0, Ordering::Relaxed);
+        at(c, ACTIVE).store(0, Ordering::Relaxed);
+        at(c, DONE).store(0, Ordering::Relaxed);
+        at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
         blake3_hash(data, total, cv);
-        return 0;
+        return 1;
     }
 
-    let target_lanes = workers + 1;
+    assert!(slice_size.is_power_of_two());
+    assert!(slice_size.is_multiple_of(CHUNK_LEN));
 
-    let mut slice_size = floor_pow2(len / target_lanes) as usize;
-    if slice_size < min_slice as usize {
-        slice_size = min_slice as usize;
-    }
+    let total_cvs = leaf_count(total, slice_size);
+    assert!(total_cvs >= 2);
+    assert!(total_cvs <= MAX_SLICES);
 
-    assert_valid_slice_size(slice_size);
-
-    let num_slices = total.div_ceil(slice_size);
-    if num_slices < 2 {
-        blake3_hash(data, total, cv);
-        return 0;
-    }
-
-    let active = core::cmp::min(workers as usize, num_slices - 1);
+    let active = core::cmp::min(wanted_bg_workers, total_cvs - 1);
+    assert!(active >= 1);
+    assert!(active <= BG_WORKERS);
 
     at(c, SLICE_SIZE).store(slice_size as i32, Ordering::Relaxed);
     at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
-    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
     at(c, DONE).store(0, Ordering::Relaxed);
+    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
 
-    let gen = at(c, GEN).fetch_add(1, Ordering::AcqRel) + 1;
+    at(c, GEN).fetch_add(1, Ordering::AcqRel);
     atomic_notify(c.add(GEN), u32::MAX);
 
-    // Caller = lane 0
-    let lanes = active + 1;
-    let mut slice = 0usize;
+    process_lane(0, active + 1, slice_size, total, data, cv);
 
-    while slice < num_slices {
-        let offset = slice * slice_size;
-        let slice_len = core::cmp::min(slice_size, total - offset);
-
-        hash_subtree_cv_at(
-            data.add(offset),
-            slice_len,
-            offset as u64,
-            cv.add(slice * CV_SIZE),
-        );
-
-        slice += lanes;
-    }
-
-    if active == 0 {
-        at(c, SIGNAL).store(gen, Ordering::Release);
-    }
-
-    num_slices as u32
+    total_cvs as u32
 }
 
-/// Merge subtree CVs into one root hash.
-/// Assumes CVs are laid out in left-to-right subtree order.
+// ── Exact root merge for the current plan ───────────────────
+
 #[no_mangle]
 pub unsafe extern "C" fn merge_cv_tree(cv_ptr: *mut u8, count: u32, out_ptr: *mut u8) {
-    let n = count as usize;
-    debug_assert!(n >= 2);
-    debug_assert!(n <= MAX_SLICES);
+    let mut len = count as usize;
 
-    let mut cvs = [[0u8; 32]; MAX_SLICES];
+    assert!(len >= 2);
+    assert!(len <= MAX_SLICES);
 
-    for i in 0..n {
-        ptr::copy_nonoverlapping(cv_ptr.add(i * CV_SIZE), cvs[i].as_mut_ptr(), CV_SIZE);
-    }
+    let mut left = [0u8; CV_SIZE];
+    let mut right = [0u8; CV_SIZE];
 
-    let mut len = n;
     while len > 2 {
-        let half = len / 2;
+        let half = len >> 1;
 
         for i in 0..half {
-            cvs[i] = merge_subtrees_non_root(&cvs[2 * i], &cvs[2 * i + 1], Mode::Hash);
+            let src = cv_ptr.add((i << 1) * CV_SIZE);
+
+            ptr::copy_nonoverlapping(src, left.as_mut_ptr(), CV_SIZE);
+            ptr::copy_nonoverlapping(src.add(CV_SIZE), right.as_mut_ptr(), CV_SIZE);
+
+            let merged = merge_subtrees_non_root(&left, &right, Mode::Hash);
+            ptr::copy_nonoverlapping(merged.as_ptr(), cv_ptr.add(i * CV_SIZE), CV_SIZE);
         }
 
-        if len % 2 == 1 {
-            cvs[half] = cvs[len - 1];
+        if (len & 1) != 0 {
+            ptr::copy_nonoverlapping(
+                cv_ptr.add((len - 1) * CV_SIZE),
+                cv_ptr.add(half * CV_SIZE),
+                CV_SIZE,
+            );
         }
 
-        len = half + (len % 2);
+        len = half + (len & 1);
     }
 
-    let root = merge_subtrees_root(&cvs[0], &cvs[1], Mode::Hash);
+    ptr::copy_nonoverlapping(cv_ptr, left.as_mut_ptr(), CV_SIZE);
+    ptr::copy_nonoverlapping(cv_ptr.add(CV_SIZE), right.as_mut_ptr(), CV_SIZE);
+
+    let root = merge_subtrees_root(&left, &right, Mode::Hash);
     ptr::copy_nonoverlapping(root.as_bytes().as_ptr(), out_ptr, CV_SIZE);
 }

@@ -1,13 +1,10 @@
-self.onmessage = async ({ data: msg }) => {
-  const { exports } = await WebAssembly.instantiate(
-    msg.wasmModule,
-    { env: { memory: msg.memory } },
-  );
+self.onmessage = async e => {
+  const { wasmModule, memory, index, ctrlPtr, dataPtr, cvPtr, stackPtr } = e.data;
 
-  if (exports.__stack_pointer) {
-    exports.__stack_pointer.value =
-      msg.stacksBase + (msg.index + 1) * msg.stackSize;
-  }
+  const { exports } = await WebAssembly.instantiate(wasmModule, {
+    env: { memory },
+  });
 
-  exports.worker_loop(msg.ctrlPtr, msg.index, msg.dataPtr, msg.cvPtr);
+  exports.__stack_pointer.value = stackPtr;
+  exports.worker_loop(ctrlPtr, index, dataPtr, cvPtr);
 };

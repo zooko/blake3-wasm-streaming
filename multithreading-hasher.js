@@ -1,242 +1,155 @@
-const WASM_URL = new URL(
-  './target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm',
-  import.meta.url,
-);
+function assert(cond, msg) {
+    if (!cond) throw new Error(msg);
+}
 
-const WORKER_URL = new URL('./hash-worker.js', import.meta.url);
-
-const PAGE = 65536;
-const CV_LEN = 32;
-const AUTO_THREAD_CAP = 4; // iPhone-targeted total-lane cap
-
-// ctrl indices
+const GEN = 0;
+const SLICE_SIZE = 1;
+const ACTIVE = 2;
+const DONE = 3;
 const SIGNAL = 4;
+const TOTAL_LEN = 5;
 const READY = 6;
 
+const CV_LEN = 32;
+const WASM_PAGES = 65536;
+
+const WASM_URL = new URL(
+    './target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm',
+    import.meta.url,
+);
+const WORKER_URL = new URL('./hash-worker.js', import.meta.url);
+
 const encoder = new TextEncoder();
+const HEX = Array.from(
+    { length: 256 },
+    (_, i) => (i + 256).toString(16).slice(1),
+);
 
 function toBytes(input) {
-  if (typeof input === 'string') {
-    return encoder.encode(input);
-  }
-  if (input instanceof Uint8Array) {
+    if (typeof input === 'string') return encoder.encode(input);
+    assert(input instanceof Uint8Array, 'expected string or Uint8Array');
     return input;
-  }
-  if (ArrayBuffer.isView(input)) {
-    return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-  }
-  if (input instanceof ArrayBuffer) {
-    return new Uint8Array(input);
-  }
-  throw new TypeError('input must be a string, Uint8Array, or ArrayBuffer');
 }
 
 function hex(bytes) {
-  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function ceilDiv(n, d) {
-  return Math.floor((n + d - 1) / d);
-}
-
-// Estimate how many subtree CVs we'd produce at the chosen minimum slice size.
-function estimateCvCountForLen(len, minSlice) {
-  return ceilDiv(len, minSlice);
-}
-
-function chooseTotalThreadsForCvCount(cvCount, maxThreads) {
-  const cap = Math.min(maxThreads, AUTO_THREAD_CAP);
-
-  if (cvCount <= 1) return 1;
-  if (cvCount <= 4) return Math.min(cap, 2);
-  if (cvCount === 5) return Math.min(cap, 3);
-  return cap;
-}
-
-function chooseAutoTotalThreads(len, minSlice, maxThreads) {
-  const cvCount = estimateCvCountForLen(len, minSlice);
-  return chooseTotalThreadsForCvCount(cvCount, maxThreads);
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) s += HEX[bytes[i]];
+    return s;
 }
 
 async function waitUntilAtLeast(ctrl, idx, target) {
-  while (true) {
-    const cur = Atomics.load(ctrl, idx);
-    if (cur >= target) return;
-
-    const r = Atomics.waitAsync(ctrl, idx, cur);
-    if (r.async) {
-      await r.value;
+    for (;;) {
+        const cur = Atomics.load(ctrl, idx);
+        if (cur >= target) return;
+        const r = Atomics.waitAsync(ctrl, idx, cur);
+        if (r.async) await r.value;
     }
-  }
 }
 
 async function waitForChange(ctrl, idx, expected) {
-  if (Atomics.load(ctrl, idx) !== expected) return;
-
-  const r = Atomics.waitAsync(ctrl, idx, expected);
-  if (r.async) {
-    await r.value;
-  }
+    for (;;) {
+        const cur = Atomics.load(ctrl, idx);
+        if (cur !== expected) return;
+        const r = Atomics.waitAsync(ctrl, idx, expected);
+        if (r.async) await r.value;
+    }
 }
 
-async function init() {
-  if (typeof Atomics.waitAsync !== 'function') {
-    throw new Error('Atomics.waitAsync is unavailable in this browser');
-  }
+export default async function init() {
+    assert(typeof Atomics.waitAsync === 'function', 'Atomics.waitAsync unavailable');
 
-  const wasmBytes = await (await fetch(WASM_URL)).arrayBuffer();
-  const wasmModule = await WebAssembly.compile(wasmBytes);
+    const wasmBytes = await (await fetch(WASM_URL)).arrayBuffer();
+    const wasmModule = await WebAssembly.compile(wasmBytes);
 
-  const memory = new WebAssembly.Memory({
-    initial: 512,
-    maximum: 65536,
-    shared: true,
-  });
-
-  const main = await WebAssembly.instantiate(wasmModule, {
-    env: { memory },
-  });
-  const wasm = main.exports;
-
-  const needPages = wasm.layout_required_pages();
-  const havePages = memory.buffer.byteLength / PAGE;
-  if (needPages > havePages) {
-    memory.grow(needPages - havePages);
-  }
-
-  const ctrlPtr = wasm.layout_ctrl_ptr();
-  const dataPtr = wasm.layout_data_ptr();
-  const outPtr = wasm.layout_out_ptr();
-  const stacksBase = wasm.layout_stacks_base();
-
-  const maxData = wasm.config_max_data();
-  const maxThreads = wasm.config_max_threads();
-
-  // Enforce the iPhone-tuned 8 KiB floor here, even if Rust still exports 4 KiB.
-  const wasmMinSlice = wasm.config_min_slice();
-  const minSlice = Math.max(wasmMinSlice, 8 * 1024);
-
-  const ctrlWords = wasm.config_ctrl_words();
-  const stackSize = wasm.config_stack_size();
-
-  wasm.clear_ctrl(ctrlPtr);
-
-  const ctrl = new Int32Array(memory.buffer, ctrlPtr, ctrlWords);
-  const heap = new Uint8Array(memory.buffer);
-
-  const bgWorkers = maxThreads - 1;
-  for (let i = 0; i < bgWorkers; i++) {
-    const worker = new Worker(WORKER_URL, { type: 'module' });
-    worker.postMessage({
-      wasmModule,
-      memory,
-      index: i,
-      ctrlPtr,
-      dataPtr,
-      cvPtr: outPtr,
-      stacksBase,
-      stackSize,
+    const memory = new WebAssembly.Memory({
+        initial: WASM_PAGES,
+        maximum: WASM_PAGES,
+        shared: true,
     });
-  }
 
-  if (bgWorkers > 0) {
-    await waitUntilAtLeast(ctrl, READY, bgWorkers);
-  }
+    const main = await WebAssembly.instantiate(wasmModule, {
+        env: { memory },
+    });
+    const wasm = main.exports;
 
-  let signalSeen = Atomics.load(ctrl, SIGNAL);
-  let busy = false;
+    const ctrlPtr = wasm.layout_ctrl_ptr();
+    const dataPtr = wasm.layout_data_ptr();
+    const outPtr = wasm.layout_out_ptr();
+    const stacksBase = wasm.layout_stacks_base();
+    const stackSize = wasm.config_stack_size();
 
-  function ensureNotBusy() {
-    if (busy) {
-      throw new Error('hasher is busy');
+    const maxData = wasm.config_max_data();
+    const maxThreads = wasm.config_max_threads();
+    const ctrlWords = wasm.config_ctrl_words();
+
+    const ctrl = new Int32Array(memory.buffer, ctrlPtr, ctrlWords);
+    const heap = new Uint8Array(memory.buffer);
+
+    const workers = new Array(maxThreads - 1);
+    for (let i = 0; i < workers.length; i++) {
+        const worker = new Worker(WORKER_URL, { type: 'module' });
+        worker.postMessage({
+            wasmModule,
+            memory,
+            index: i,
+            ctrlPtr,
+            dataPtr,
+            cvPtr: outPtr,
+            stackPtr: stacksBase + (i + 1) * stackSize,
+        });
+        workers[i] = worker;
     }
-  }
 
-  function loadInput(input) {
-    const bytes = toBytes(input);
-    if (bytes.length > maxData) {
-      throw new Error(`input too large: ${bytes.length} > ${maxData}`);
+    if (workers.length !== 0) {
+        await waitUntilAtLeast(ctrl, READY, workers.length);
     }
-    heap.set(bytes, dataPtr);
-    return bytes.length;
-  }
 
-  function readDigestHex() {
-    return hex(new Uint8Array(memory.buffer, outPtr, CV_LEN));
-  }
+    let signalSeen = Atomics.load(ctrl, SIGNAL);
+    let busy = false;
 
-  function hash(input) {
-    ensureNotBusy();
-    const len = loadInput(input);
-    wasm.blake3_hash(dataPtr, len, outPtr);
-    return readDigestHex();
-  }
+    function loadInput(input) {
+        const bytes = toBytes(input);
+        assert(bytes.length <= maxData, 'input too large');
+        heap.set(bytes, dataPtr);
+        return bytes.length;
+    }
 
-  // Default behavior is now AUTO, not "always use maxThreads".
-  // You can still pass an explicit totalThreads override.
-  async function hashParallel(input, totalThreads = undefined) {
-    ensureNotBusy();
-    busy = true;
+    function readDigestHex() {
+        return hex(new Uint8Array(memory.buffer, outPtr, CV_LEN));
+    }
 
-    try {
-      const len = loadInput(input);
-
-      const autoThreads = chooseAutoTotalThreads(len, minSlice, maxThreads);
-      const threads =
-        totalThreads == null
-          ? autoThreads
-          : Math.max(1, Math.min(maxThreads, totalThreads | 0));
-
-      const bgWorkers = threads - 1;
-
-      // Fast path: avoid dispatch/wait/merge when auto policy chooses 1 lane.
-      if (threads === 1) {
+    function hash(input) {
+        assert(!busy, 'busy');
+        const len = loadInput(input);
         wasm.blake3_hash(dataPtr, len, outPtr);
         return readDigestHex();
-      }
-
-      const expected = signalSeen;
-
-      const totalCvs = wasm.dispatch(
-        ctrlPtr,
-        dataPtr,
-        len,
-        outPtr,
-        bgWorkers,
-        minSlice,
-      );
-
-      if (totalCvs >= 2) {
-        await waitForChange(ctrl, SIGNAL, expected);
-        signalSeen = Atomics.load(ctrl, SIGNAL);
-        wasm.merge_cv_tree(outPtr, totalCvs, outPtr);
-      }
-
-      return readDigestHex();
-    } finally {
-      busy = false;
     }
-  }
 
-  return {
-    maxData,
-    maxThreads,
-    minSlice,
+    async function hashParallel(input) {
+        assert(!busy, 'busy');
+        busy = true;
 
-    // Handy introspection helpers for benchmarking/debugging.
-    estimateCvCount(input) {
-      const len = typeof input === 'number' ? input : toBytes(input).length;
-      return estimateCvCountForLen(len, minSlice);
-    },
+        try {
+            const len = loadInput(input);
+            const expected = signalSeen;
+            const totalCvs = wasm.dispatch_auto(ctrlPtr, dataPtr, len, outPtr);
 
-    chooseTotalThreads(input) {
-      const len = typeof input === 'number' ? input : toBytes(input).length;
-      return chooseAutoTotalThreads(len, minSlice, maxThreads);
-    },
+            if (totalCvs > 1) {
+                await waitForChange(ctrl, SIGNAL, expected);
+                signalSeen = Atomics.load(ctrl, SIGNAL);
+                wasm.merge_cv_tree(outPtr, totalCvs, outPtr);
+            }
 
-    hash,
-    hashParallel,
-  };
+            return readDigestHex();
+        } finally {
+            busy = false;
+        }
+    }
+
+    return {
+        maxData,
+        maxThreads,
+        hash,
+        hashParallel,
+    };
 }
-
-export default init();

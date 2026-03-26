@@ -8,27 +8,25 @@
     <pre id="out">Loading…</pre>
     <script src="coi-serviceworker.min.js"></script>
     <script type="module">
-     import hasher from '../multithreading-hasher.js';
-
-     const h = await hasher;
+     import init from '../multithreading-hasher.js';
+     const h = await init();
 
      const smallInput = 'abcdefghihjl';
      const largeInput = 'abcdefghihjl'.repeat(20000);
 
-     const smallSync = h.hash(smallInput);
-     const smallAsync = await h.hashParallel(smallInput);
+     const smallDirect = h.hash(smallInput);
+     const smallParallel = await h.hashParallel(smallInput);
 
-     const largeSync = h.hash(largeInput);
-     const largeAsync = await h.hashParallel(largeInput);
+     const largeDirect = h.hash(largeInput);
+     const largeParallel = await h.hashParallel(largeInput);
 
      document.getElementById('out').textContent =
-       `max threads: ${h.maxThreads}\n\n` +
        `small input: ${smallInput}\n` +
-       `small sync:  ${smallSync}\n` +
-       `small async: ${smallAsync}\n\n` +
+       `small direct:   ${smallDirect}\n` +
+       `small parallel: ${smallParallel}\n\n` +
        `large input length: ${largeInput.length} bytes\n` +
-       `large sync:  ${largeSync}\n` +
-       `large async: ${largeAsync}\n`;
+       `large direct:   ${largeDirect}\n` +
+       `large parallel: ${largeParallel}\n`;
     </script>
   </body>
 </html>
