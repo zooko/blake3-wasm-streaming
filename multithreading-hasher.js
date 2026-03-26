@@ -7,6 +7,7 @@ const WORKER_URL = new URL('./hash-worker.js', import.meta.url);
 
 const PAGE = 65536;
 const CV_LEN = 32;
+const AUTO_THREAD_CAP = 4; // iPhone-targeted total-lane cap
 
 // ctrl indices
 const SIGNAL = 4;
@@ -32,6 +33,29 @@ function toBytes(input) {
 
 function hex(bytes) {
   return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function ceilDiv(n, d) {
+  return Math.floor((n + d - 1) / d);
+}
+
+// Estimate how many subtree CVs we'd produce at the chosen minimum slice size.
+function estimateCvCountForLen(len, minSlice) {
+  return ceilDiv(len, minSlice);
+}
+
+function chooseTotalThreadsForCvCount(cvCount, maxThreads) {
+  const cap = Math.min(maxThreads, AUTO_THREAD_CAP);
+
+  if (cvCount <= 1) return 1;
+  if (cvCount <= 4) return Math.min(cap, 2);
+  if (cvCount === 5) return Math.min(cap, 3);
+  return cap;
+}
+
+function chooseAutoTotalThreads(len, minSlice, maxThreads) {
+  const cvCount = estimateCvCountForLen(len, minSlice);
+  return chooseTotalThreadsForCvCount(cvCount, maxThreads);
 }
 
 async function waitUntilAtLeast(ctrl, idx, target) {
@@ -87,7 +111,11 @@ async function init() {
 
   const maxData = wasm.config_max_data();
   const maxThreads = wasm.config_max_threads();
-  const minSlice = wasm.config_min_slice();
+
+  // Enforce the iPhone-tuned 8 KiB floor here, even if Rust still exports 4 KiB.
+  const wasmMinSlice = wasm.config_min_slice();
+  const minSlice = Math.max(wasmMinSlice, 8 * 1024);
+
   const ctrlWords = wasm.config_ctrl_words();
   const stackSize = wasm.config_stack_size();
 
@@ -144,15 +172,28 @@ async function init() {
     return readDigestHex();
   }
 
-  async function hashParallel(input, totalThreads = maxThreads) {
+  // Default behavior is now AUTO, not "always use maxThreads".
+  // You can still pass an explicit totalThreads override.
+  async function hashParallel(input, totalThreads = undefined) {
     ensureNotBusy();
     busy = true;
 
     try {
       const len = loadInput(input);
 
-      totalThreads = Math.max(1, Math.min(maxThreads, totalThreads | 0));
-      const bgWorkers = totalThreads - 1;
+      const autoThreads = chooseAutoTotalThreads(len, minSlice, maxThreads);
+      const threads =
+        totalThreads == null
+          ? autoThreads
+          : Math.max(1, Math.min(maxThreads, totalThreads | 0));
+
+      const bgWorkers = threads - 1;
+
+      // Fast path: avoid dispatch/wait/merge when auto policy chooses 1 lane.
+      if (threads === 1) {
+        wasm.blake3_hash(dataPtr, len, outPtr);
+        return readDigestHex();
+      }
 
       const expected = signalSeen;
 
@@ -180,6 +221,19 @@ async function init() {
   return {
     maxData,
     maxThreads,
+    minSlice,
+
+    // Handy introspection helpers for benchmarking/debugging.
+    estimateCvCount(input) {
+      const len = typeof input === 'number' ? input : toBytes(input).length;
+      return estimateCvCountForLen(len, minSlice);
+    },
+
+    chooseTotalThreads(input) {
+      const len = typeof input === 'number' ? input : toBytes(input).length;
+      return chooseAutoTotalThreads(len, minSlice, maxThreads);
+    },
+
     hash,
     hashParallel,
   };

@@ -12,7 +12,7 @@ const CV_SIZE: usize = 32;
 
 // Public runtime/layout config.
 const MAX_DATA: usize = 2_000_000;
-const MIN_SLICE: usize = 4 * 1024;
+const MIN_SLICE: usize = 8 * 1024;
 const MAX_THREADS: usize = 4; // total lanes including caller
 const BG_WORKERS: usize = MAX_THREADS - 1;
 const MAX_SLICES: usize = (MAX_DATA + MIN_SLICE - 1) / MIN_SLICE;
