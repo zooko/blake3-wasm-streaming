@@ -129,7 +129,7 @@
       count.</p>
     <div id="sweep-results"></div>
 
-    <h2>Auto (default maxThreads = 8)</h2>
+    <h2>Auto</h2>
     <div id="auto-results"></div>
 
     <pre id="log"></pre>
@@ -148,6 +148,12 @@
        128 * 1024-1,
        128 * 1024,
        128 * 1024+1,
+       140000,
+       150000,
+       160000,
+       170000,
+       180000,
+       190000,
        200000,
        230000,
        262208,
@@ -233,7 +239,7 @@
 
      function cellClass(ratio) {
        return ratio > 1.10 ? "cell-win"
-         : ratio < 0.90 ? "cell-lose" : "";
+                    : ratio < 0.90 ? "cell-lose" : "";
      }
 
      function canRunParallel(bytes, threads) {
@@ -260,9 +266,7 @@
        configEl.textContent =
          "Library config: maxThreads = " +
          hasher.maxThreads +
-         ", maxCvs = " + hasher.maxCvs +
-         ", maxData = " + fmtSize(hasher.maxData) +
-         ", sliceSize = " + fmtSize(hasher.sliceSize);
+         ", maxData = " + fmtSize(hasher.maxData)
      }
 
      function hashBlake3(bytes) {
@@ -359,7 +363,6 @@
          const bytes = DATA_SIZES[si];
          let bestMs = b3Base[si];
          let bestT = 1;
-         let bestCvs = 1;
 
          html += `<tr><td>${fmtSize(bytes)}</td>`;
 
@@ -387,7 +390,6 @@
            if (r.ms < bestMs) {
              bestMs = r.ms;
              bestT = t;
-             bestCvs = r.cvs;
            }
 
            const vsSha = shaBase[si] / r.ms;
@@ -400,7 +402,6 @@
                ${vsSha.toFixed(2)}× vs SHA</span><br>
              <span class="dim">
                ${vs1T.toFixed(2)}× vs 1T</span><br>
-             <span class="dim">${r.cvs} CV</span>
            </td>`;
          }
 
@@ -413,9 +414,7 @@
              ${bestVsSha.toFixed(2)}× vs SHA</span><br>
            <span class="dim">
              ${bestVs1T.toFixed(2)}× vs 1T</span><br>
-           <span class="dim">${bestT}T${
-             bestT > 1 ? ` · ${bestCvs} CV` : ""
-           }</span>
+           <span class="dim">${bestT}</span>
          </td></tr>`;
        }
 
@@ -452,7 +451,6 @@
            <td class="${cellClass(vsSha)}">
              <b>${vsSha.toFixed(2)}×</b></td>
            <td><b>${vs1T.toFixed(2)}×</b></td>
-           <td>${r.threads}T · ${r.totalCvs} CV</td>
            <td class="dim">${r.autoIters}</td>
          </tr>`;
        }
@@ -486,7 +484,6 @@
 
          log(`maxThreads = ${hasher.maxThreads}`);
          log(`maxData    = ${fmtSize(hasher.maxData)}`);
-         log(`sliceSize  = ${fmtSize(hasher.sliceSize)}`);
          log(`mode       = ${quick ? "quick" : "full"}`);
          flushLog();
 
@@ -512,7 +509,7 @@
                `mismatch ${t}T ${bytes}: ` +
                `expected ${expected}, got ${got}`);
              log(`  ✓ ${t}T ${fmtSize(bytes)} ` +
-               `(${info.threads}T · ${info.totalCvs} CV)`);
+                 `(${info.threads}T`);
            }
          }
 
@@ -529,7 +526,7 @@
              `auto mismatch ${bytes}: ` +
              `expected ${expected}, got ${got}`);
            log(`  ✓ ${fmtSize(bytes).padStart(10)} ` +
-             `${info.threads}T · ${info.totalCvs} CV`);
+               `${info.threads}T`);
          }
 
          flushLog();
@@ -593,12 +590,9 @@
 
              if (!canRunParallel(bytes, t)) {
                log(`  ${fmtSize(bytes).padStart(12)} × ` +
-                 `${t}T  -> skipped`);
+                   `${t}T  -> skipped`);
                continue;
              }
-
-             const probe = await hasher.hashParallelBytes(
-               getInput(bytes), t);
 
              const result = await measureAsync(
                () => hasher.hashParallelBytes(
@@ -606,8 +600,7 @@
                numM, targetMs);
 
              sweep[si][ti] = {
-               ms: result.ms,
-               cvs: probe.totalCvs,
+               ms: result.ms
              };
 
              const vsSha = shaBase[si] / result.ms;
@@ -619,8 +612,7 @@
                ` (${result.iters})` +
                `  ${fmtTimePerByte(result.ms, bytes)}` +
                `  ${vsSha.toFixed(2)}× vs SHA` +
-               `  ${vs1T.toFixed(2)}× vs 1T` +
-               `  ${probe.totalCvs} CV`);
+               `  ${vs1T.toFixed(2)}× vs 1T`)
            }
 
            renderSweepTable(
@@ -630,60 +622,6 @@
 
          renderSweepTable(
            threadCounts, sweep, b3Base, shaBase);
-         flushLog();
-
-         // ── Auto benchmarks ──
-
-         setStatus("Running auto benchmarks…");
-
-         const autoRows = [];
-
-         for (const bytes of DATA_SIZES) {
-           const baseline = baselineByBytes.get(bytes);
-           const probe = await hasher.hashParallelBytes(
-             getInput(bytes));
-
-           if (probe.threads < 2) {
-             autoRows.push({
-               bytes,
-               sizeLabel: fmtSize(bytes),
-               skip: true,
-             });
-             log(`${fmtSize(bytes).padStart(10)}  ` +
-               `auto  1T fallback`);
-             continue;
-           }
-
-           const auto = await measureAsync(
-             () => hasher.hashParallelBytes(getInput(bytes)),
-             numM, targetMs);
-
-           const row = {
-             bytes,
-             sizeLabel: fmtSize(bytes),
-             autoMs: auto.ms,
-             autoIters: auto.iters,
-             directMs: baseline.directMs,
-             shaMs: baseline.shaMs,
-             totalCvs: probe.totalCvs,
-             threads: probe.threads,
-           };
-           autoRows.push(row);
-
-           const vsSha = row.shaMs / row.autoMs;
-           const vs1T = row.directMs / row.autoMs;
-
-           log(
-             `${fmtSize(bytes).padStart(10)}  ` +
-             `auto ${fmtMs(row.autoMs).padStart(13)} ` +
-             `(${row.autoIters})  ` +
-             `${fmtTimePerByte(row.autoMs, bytes)}  ` +
-             `vs-sha ${vsSha.toFixed(2)}×  ` +
-             `vs-1t ${vs1T.toFixed(2)}×  ` +
-             `${row.threads}T · ${row.totalCvs} CV`);
-         }
-
-         renderAutoTable(autoRows);
          flushLog();
 
          setStatus("Done");

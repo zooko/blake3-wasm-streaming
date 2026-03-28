@@ -96,8 +96,6 @@ export default async function init() {
     const data = new Uint8Array(memory.buffer, dataPtr, DATA_BUF_SIZE);
     const out = new Uint8Array(memory.buffer, outPtr, CV_LEN);
 
-    ctrl.fill(0);
-
     const bgWorkers = MAX_THREADS - 1;
     for (let i = 0; i < bgWorkers; i++) {
         const worker = new Worker(WORKER_URL, { type: 'module' });
@@ -148,16 +146,23 @@ export default async function init() {
         assert(len <= DATA_BUF_SIZE, 'input too large');
         data.set(bytes);
 
-        const threads =
-            Math.min(maxThreads, (len / SLICE_SIZE) | 0);
+        if (len < SLICE_SIZE * 9) {
+        }
+        
+        // tuned for Apple Silicon A18 Pro in iPhone 16 Pro
+        // const threads = Math.min(maxThreads, len < SLICE_SIZE * 17 ? 2 : 8);
 
-        if (threads < 2) {
+        // tuned for Apple Silicon M4 Max in Macbook Pro
+        const threads = Math.min(maxThreads, len < SLICE_SIZE * 17 ? 2 : 8);
+
+        if (threads === 1) {
             wasm.blake3_hash(dataPtr, len, outPtr);
             busy = false;
-            return { totalCvs: 1, threads: 1 };
+            return { threads: 1 };
         }
 
         const expected = signalSeen;
+        // xxx compute totalCvs directly from the input size (and the constant SLICE_SIZE), and remove the code that returns totalCvs from parallel_hash and remove all code that expects it to be returned from parallel_hash
         const totalCvs = wasm.parallel_hash(
             ctrlPtr, dataPtr, len, outPtr, threads,
         );
@@ -167,7 +172,7 @@ export default async function init() {
 
         wasm.merge_cv_tree(outPtr, totalCvs, outPtr);
         busy = false;
-        return { totalCvs, threads };
+        return { threads };
     }
 
     async function hashParallel(
@@ -182,7 +187,6 @@ export default async function init() {
         maxData: DATA_BUF_SIZE,
         maxThreads: MAX_THREADS,
         maxCvs: MAX_SLICES,
-        sliceSize: SLICE_SIZE,
         hash,
         hashParallel,
         hashBytes,

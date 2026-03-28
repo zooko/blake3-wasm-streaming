@@ -12,11 +12,9 @@ use core::{
     sync::atomic::{AtomicI32, Ordering},
 };
 
-const CHUNK_SIZE: usize = 1024;
 const SLICE_SIZE: usize = 16384;
 const CV_SIZE: usize = 32;
 
-const MAX_THREADS: usize = 8;
 const MAX_DATA: usize = 1 << 29;
 const MAX_SLICES: usize = MAX_DATA / SLICE_SIZE;
 
@@ -59,13 +57,6 @@ fn full_prefix_len(total: usize) -> usize {
     total & !(SLICE_SIZE - 1)
 }
 
-#[inline(always)]
-fn leaf_count(total: usize) -> usize {
-    let full = full_prefix_len(total);
-    let tail = total - full;
-    (full / SLICE_SIZE) + (tail != 0) as usize
-}
-
 // ── Layout export ───────────────────────────────────────────
 
 #[no_mangle]
@@ -100,7 +91,7 @@ unsafe fn hash_slice_cv_at(
     out: *mut u8,
 ) {
     debug_assert!(len != 0);
-    debug_assert!(offset.is_multiple_of(CHUNK_SIZE as u64));
+    debug_assert!(offset.is_multiple_of(SLICE_SIZE as u64));
 
     let input = slice::from_raw_parts(data, len);
     let mut hasher = blake3::Hasher::new();
@@ -118,33 +109,28 @@ unsafe fn hash_slice_cv_at(
 unsafe fn process_lane(
     lane: usize,
     lanes: usize,
-    total: usize,
+    num_full: usize,
     data: *const u8,
     cv: *mut u8,
 ) {
-    let full = full_prefix_len(total);
-    let num_full = full / SLICE_SIZE;
-    let tail = total - full;
+    let base = num_full / lanes;
+    let extra = num_full % lanes;
+    let start = if lane < extra {
+        lane * (base + 1)
+    } else {
+        extra + lane * base
+    };
+    let count = base + (lane < extra) as usize;
 
-    let mut s = lane;
-    while s < num_full {
-        let offset = s * SLICE_SIZE;
-        hash_slice_cv_at(
-            data.add(offset),
-            SLICE_SIZE,
-            offset as u64,
-            cv.add(s * CV_SIZE),
-        );
-        s += lanes;
-    }
+    let mut ptr = data.add(start * SLICE_SIZE);
+    let mut cv_out = cv.add(start * CV_SIZE);
+    let mut offset = (start * SLICE_SIZE) as u64;
 
-    if tail != 0 && lane == (num_full % lanes) {
-        hash_slice_cv_at(
-            data.add(full),
-            tail,
-            full as u64,
-            cv.add(num_full * CV_SIZE),
-        );
+    for _ in 0..count {
+        hash_slice_cv_at(ptr, SLICE_SIZE, offset, cv_out);
+        ptr = ptr.add(SLICE_SIZE);
+        cv_out = cv_out.add(CV_SIZE);
+        offset += SLICE_SIZE as u64;
     }
 }
 
@@ -156,18 +142,31 @@ unsafe fn dispatch_parallel(
     cv: *mut u8,
     num_threads: usize,
 ) -> u32 {
-    let total_cvs = leaf_count(total);
+    let full = full_prefix_len(total);
+    let num_full = full / SLICE_SIZE;
+    let tail = total - full;
+    let total_cvs = num_full + (tail != 0) as usize;
     debug_assert!(total_cvs <= MAX_SLICES);
     let active = num_threads - 1;
 
     at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
     at(c, DONE).store(0, Ordering::Relaxed);
-    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
+    at(c, TOTAL_LEN).store(num_full as i32, Ordering::Relaxed);
 
     at(c, GEN).fetch_add(1, Ordering::AcqRel);
     atomic_notify(c.add(GEN), u32::MAX);
 
-    process_lane(0, num_threads, total, data, cv);
+    process_lane(0, num_threads, num_full, data, cv);
+
+    if tail != 0 {
+        hash_slice_cv_at(
+            data.add(full),
+            tail,
+            full as u64,
+            cv.add(num_full * CV_SIZE),
+        );
+    }
+
     total_cvs as u32
 }
 
@@ -206,10 +205,10 @@ pub unsafe extern "C" fn worker_loop(
             continue;
         }
 
-        let total =
+        let num_full =
             at(c, TOTAL_LEN).load(Ordering::Relaxed) as usize;
 
-        process_lane(lane, lanes, total, data, cv);
+        process_lane(lane, lanes, num_full, data, cv);
 
         if at(c, DONE).fetch_add(1, Ordering::AcqRel)
             == active as i32 - 1
@@ -234,7 +233,6 @@ pub unsafe extern "C" fn parallel_hash(
     let num_threads = num_threads as usize;
 
     debug_assert!(num_threads >= 2);
-    debug_assert!(num_threads <= MAX_THREADS);
     debug_assert!(total >= num_threads * SLICE_SIZE);
 
     dispatch_parallel(c, data, total, cv, num_threads)
