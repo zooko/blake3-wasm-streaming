@@ -13,19 +13,14 @@ use core::{
 };
 
 const CHUNK_SIZE: usize = 1024;
+const MIN_SLICE_SIZE: usize = 4096;
 const CV_SIZE: usize = 32;
 
 // Total lanes including caller.
 const MAX_THREADS: usize = 8;
-const BG_WORKERS: usize = MAX_THREADS - 1;
 
-// Planner.
-const DIRECT_CUTOFF: usize = 96 * 1024;
-const SLICE_64K: usize = 64 * 1024;
-const SLICE_128K: usize = 128 * 1024;
-const SLICE_256K: usize = 256 * 1024;
-
-const MAX_SLICES: usize = MAX_THREADS * 4;
+const MAX_DATA: usize = 1 << 29;
+const MAX_SLICES: usize = MAX_DATA / MIN_SLICE_SIZE;
 
 const ALIGN: usize = 16;
 
@@ -63,23 +58,16 @@ unsafe fn at(c: *mut i32, i: usize) -> &'static AtomicI32 {
 }
 
 #[inline(always)]
-fn choose_plan(len: usize) -> (usize, usize) {
-    if len < DIRECT_CUTOFF {
-        return (0, 0);
-    }
-    if len < 256 * 1024 {
-        return (SLICE_64K, 1);
-    }
-    if len < 320 * 1024 {
-        return (SLICE_64K, 2);
-    }
-    if len < 384 * 1024 {
-        return (SLICE_64K, 3);
-    }
-    if len < 1024 * 1024 {
-        return (SLICE_128K, 2);
-    }
-    (SLICE_256K, 3)
+fn floor_pow2(x: usize) -> usize {
+    debug_assert!(x != 0);
+    1usize << (usize::BITS - 1 - x.leading_zeros())
+}
+
+#[inline(always)]
+fn choose_auto_slice_size(total: usize, num_threads: usize) -> usize {
+    let limit = total / num_threads;
+    debug_assert!(limit >= MIN_SLICE_SIZE);
+    floor_pow2(limit)
 }
 
 #[inline(always)]
@@ -94,7 +82,7 @@ fn leaf_count(total: usize, slice_size: usize) -> usize {
     (full / slice_size) + (tail != 0) as usize
 }
 
-// ── Layout export ───────────────────────────────────
+// ── Layout export ───────────────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn layout_ctrl_ptr() -> usize {
@@ -110,12 +98,12 @@ pub unsafe extern "C" fn blake3_hash(data_ptr: *const u8, data_len: usize, out_p
     ptr::copy_nonoverlapping(hash.as_bytes().as_ptr(), out_ptr, CV_SIZE);
 }
 
-// ── Direct subtree-CV hashing for planner slices ────────────
+// ── Parallel subtree-CV hashing ─────────────────────────────
 
 #[inline(always)]
 unsafe fn hash_slice_cv_at(data: *const u8, len: usize, offset: u64, out: *mut u8) {
-    assert!(len != 0);
-    assert!(offset.is_multiple_of(CHUNK_SIZE as u64));
+    debug_assert!(len != 0);
+    debug_assert!(offset.is_multiple_of(CHUNK_SIZE as u64));
 
     let input = slice::from_raw_parts(data, len);
     let mut hasher = blake3::Hasher::new();
@@ -165,45 +153,17 @@ unsafe fn process_lane(
 }
 
 #[inline(always)]
-unsafe fn dispatch_direct(
-    c: *mut i32,
-    data: *const u8,
-    total: usize,
-    cv: *mut u8,
-) -> u32 {
-    at(c, SLICE_SIZE).store(0, Ordering::Relaxed);
-    at(c, ACTIVE).store(0, Ordering::Relaxed);
-    at(c, DONE).store(0, Ordering::Relaxed);
-    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
-    blake3_hash(data, total, cv);
-    1
-}
-
-#[inline(always)]
 unsafe fn dispatch_parallel_fixed(
     c: *mut i32,
     data: *const u8,
     total: usize,
     cv: *mut u8,
+    num_threads: usize,
     slice_size: usize,
-    wanted_bg_workers: usize,
 ) -> u32 {
-    if wanted_bg_workers == 0 {
-        return dispatch_direct(c, data, total, cv);
-    }
-
     let total_cvs = leaf_count(total, slice_size);
-    if total_cvs < 2 {
-        return dispatch_direct(c, data, total, cv);
-    }
-
-    assert!(slice_size.is_power_of_two());
-    assert!(slice_size >= CHUNK_SIZE);
-
-    assert!(total_cvs <= MAX_SLICES);
-
-    let active = core::cmp::min(wanted_bg_workers, total_cvs - 1);
-    assert!(active <= BG_WORKERS);
+    debug_assert!(total_cvs <= MAX_SLICES);
+    let active = num_threads - 1;
 
     at(c, SLICE_SIZE).store(slice_size as i32, Ordering::Relaxed);
     at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
@@ -213,7 +173,7 @@ unsafe fn dispatch_parallel_fixed(
     at(c, GEN).fetch_add(1, Ordering::AcqRel);
     atomic_notify(c.add(GEN), u32::MAX);
 
-    process_lane(0, active + 1, slice_size, total, data, cv);
+    process_lane(0, num_threads, slice_size, total, data, cv);
     total_cvs as u32
 }
 
@@ -254,9 +214,6 @@ pub unsafe extern "C" fn worker_loop(
         let slice_size = at(c, SLICE_SIZE).load(Ordering::Relaxed) as usize;
         let total = at(c, TOTAL_LEN).load(Ordering::Relaxed) as usize;
 
-        assert!(slice_size.is_power_of_two());
-        assert!(slice_size.is_multiple_of(CHUNK_SIZE));
-
         process_lane(lane, lanes, slice_size, total, data, cv);
 
         if at(c, DONE).fetch_add(1, Ordering::AcqRel) == active as i32 - 1 {
@@ -266,44 +223,38 @@ pub unsafe extern "C" fn worker_loop(
     }
 }
 
-// ── Planner + dispatch ──────────────────────────────────────
+// ── Parallel hash ───────────────────────────────────────────
+//
+// slice_size == 0 means "choose automatically".
 
 #[no_mangle]
-pub unsafe extern "C" fn dispatch(
+pub unsafe extern "C" fn parallel_hash(
     c: *mut i32,
     data: *const u8,
     len: u32,
     cv: *mut u8,
-    bg_workers: u32,
-    min_slice: u32,
+    num_threads: u32,
+    slice_size: u32,
 ) -> u32 {
     let total = len as usize;
-    let wanted_bg_workers = bg_workers as usize;
-    let mut slice_size = min_slice as usize;
+    let num_threads = num_threads as usize;
 
-    assert!(wanted_bg_workers <= BG_WORKERS);
-    assert!(slice_size.is_power_of_two());
-    assert!(slice_size >= CHUNK_SIZE);
+    debug_assert!(num_threads >= 2);
+    debug_assert!(num_threads <= MAX_THREADS);
+    debug_assert!(num_threads <= total / MIN_SLICE_SIZE);
 
-    while leaf_count(total, slice_size) > MAX_SLICES {
-        slice_size <<= 1;
-    }
+    let slice_size = if slice_size == 0 {
+        choose_auto_slice_size(total, num_threads)
+    } else {
+        slice_size as usize
+    };
 
-    dispatch_parallel_fixed(c, data, total, cv, slice_size, wanted_bg_workers)
-}
+    debug_assert!(slice_size.is_power_of_two());
+    debug_assert!(slice_size >= MIN_SLICE_SIZE);
+    debug_assert!(slice_size <= total);
+    debug_assert!(slice_size <= total / num_threads);
 
-#[no_mangle]
-pub unsafe extern "C" fn dispatch_auto(
-    c: *mut i32,
-    data: *const u8,
-    len: u32,
-    cv: *mut u8,
-) -> u32 {
-    let total = len as usize;
-
-    let (slice_size, wanted_bg_workers) = choose_plan(total);
-
-    dispatch_parallel_fixed(c, data, total, cv, slice_size, wanted_bg_workers)
+    dispatch_parallel_fixed(c, data, total, cv, num_threads, slice_size)
 }
 
 // ── Exact root merge for the current plan ───────────────────
@@ -312,8 +263,7 @@ pub unsafe extern "C" fn dispatch_auto(
 pub unsafe extern "C" fn merge_cv_tree(cv_ptr: *mut u8, count: u32, out_ptr: *mut u8) {
     let mut len = count as usize;
 
-    assert!(len >= 2);
-    assert!(len <= MAX_SLICES);
+    debug_assert!(len >= 2);
 
     let mut left = [0u8; CV_SIZE];
     let mut right = [0u8; CV_SIZE];

@@ -2,22 +2,19 @@ function assert(cond, msg) {
     if (!cond) throw new Error(msg);
 }
 
-const GEN = 0;
-const SLICE_SIZE = 1;
-const ACTIVE = 2;
-const DONE = 3;
-const SIGNAL = 4;
-const TOTAL_LEN = 5;
-const READY = 6;
+const SLICE_SIZE_BYTE = 1;
+const SIGNAL_BYTE = 4;
+const READY_BYTE = 6;
 
 const CTRL_WORDS = 7;
 const CTRL_BYTES_PADDED = 32;
+const MIN_SLICE_SIZE = 4096;
 const CV_LEN = 32;
 const WASM_PAGES = 16384;
 
-const MAX_DATA = 1 << 29;
+const DATA_BUF_SIZE = 1 << 28;
 const MAX_THREADS = 8;
-const MAX_SLICES = MAX_THREADS * 4;
+const MAX_SLICES = DATA_BUF_SIZE / MIN_SLICE_SIZE;
 const STACK_SIZE = 65536;
 
 const WASM_URL = new URL(
@@ -85,11 +82,11 @@ export default async function init() {
 
     const ctrlPtr = wasm.layout_ctrl_ptr();
     const dataPtr = ctrlPtr + CTRL_BYTES_PADDED;
-    const outPtr = dataPtr + MAX_DATA;
+    const outPtr = dataPtr + DATA_BUF_SIZE;
     const stacksBase = outPtr + MAX_SLICES * CV_LEN;
 
     const ctrl = new Int32Array(memory.buffer, ctrlPtr, CTRL_WORDS);
-    const data = new Uint8Array(memory.buffer, dataPtr, MAX_DATA);
+    const data = new Uint8Array(memory.buffer, dataPtr, DATA_BUF_SIZE);
     const out = new Uint8Array(memory.buffer, outPtr, CV_LEN);
 
     ctrl.fill(0);
@@ -109,16 +106,16 @@ export default async function init() {
     }
 
     if (bgWorkers !== 0) {
-        await waitUntilAtLeast(ctrl, READY, bgWorkers);
+        await waitUntilAtLeast(ctrl, READY_BYTE, bgWorkers);
     }
 
-    let signalSeen = Atomics.load(ctrl, SIGNAL);
+    let signalSeen = Atomics.load(ctrl, SIGNAL_BYTE);
     let busy = false;
 
     function loadInput(input) {
         const bytes = normalizeInput(input);
         const len = bytes.length;
-        assert(len <= MAX_DATA, `input too large: ${len}`);
+        assert(len <= DATA_BUF_SIZE, `input too large: ${len}`);
         data.set(bytes);
         return len;
     }
@@ -133,66 +130,68 @@ export default async function init() {
         wasm.blake3_hash(dataPtr, len, outPtr);
     }
 
-    async function hashParallelBytes(input) {
+    async function hashParallelBytes(input, totalThreads, sliceSize = 0) {
         assert(!busy, 'busy');
+        assert(totalThreads >= 2, 'totalThreads must be at least 2');
+        assert(totalThreads <= MAX_THREADS, 'totalThreads too large');
+
         busy = true;
 
         try {
             const len = loadInput(input);
-            const expected = signalSeen;
-            const totalCvs = wasm.dispatch_auto(ctrlPtr, dataPtr, len, outPtr);
+            const maxThreadsForLen = len >>> 12;
+            assert(
+                totalThreads <= maxThreadsForLen,
+                'totalThreads too large for input length',
+            );
 
-            if (totalCvs > 1) {
-                await waitForChange(ctrl, SIGNAL, expected);
-                signalSeen = Atomics.load(ctrl, SIGNAL);
-                wasm.merge_cv_tree(outPtr, totalCvs, outPtr);
+            if (sliceSize !== 0) {
+                const maxSliceSize = Math.floor(len / totalThreads);
+                assert(
+                    (sliceSize & (sliceSize - 1)) === 0,
+                    'sliceSize must be a power of two',
+                );
+                assert(
+                    sliceSize >= MIN_SLICE_SIZE,
+                    'sliceSize must be at least 4096',
+                );
+                assert(sliceSize <= len, 'sliceSize too large');
+                assert(
+                    sliceSize <= maxSliceSize,
+                    'sliceSize too large for thread count',
+                );
+                assert(
+                    len <= MAX_SLICES * sliceSize,
+                    'sliceSize too small for input length',
+                );
             }
+
+            const expected = signalSeen;
+            const totalCvs = wasm.parallel_hash(
+                ctrlPtr,
+                dataPtr,
+                len,
+                outPtr,
+                totalThreads,
+                sliceSize,
+            );
+
+            await waitForChange(ctrl, SIGNAL_BYTE, expected);
+            signalSeen = Atomics.load(ctrl, SIGNAL_BYTE);
+            wasm.merge_cv_tree(outPtr, totalCvs, outPtr);
 
             return {
                 totalCvs,
-                sliceSize: totalCvs > 1 ? Atomics.load(ctrl, SLICE_SIZE) : 0,
-                threads: totalCvs > 1 ? Atomics.load(ctrl, ACTIVE) + 1 : 1,
-                direct: totalCvs === 1,
+                sliceSize: Atomics.load(ctrl, SLICE_SIZE_BYTE),
             };
         } finally {
             busy = false;
         }
     }
 
-    async function hashParallelBytesManual(input, totalThreads, minSliceSize) {
-        assert(!busy, 'busy');
-        assert(totalThreads >= 2, 'threadCount must be at least 2');
-        assert(totalThreads <= MAX_THREADS, 'threadCount too large');
-
-        busy = true;
-
-        try {
-            const len = loadInput(input);
-            const expected = signalSeen;
-            const totalCvs = wasm.dispatch(
-                ctrlPtr,
-                dataPtr,
-                len,
-                outPtr,
-                totalThreads - 1,
-                minSliceSize,
-            );
-
-            if (totalCvs > 1) {
-                await waitForChange(ctrl, SIGNAL, expected);
-                signalSeen = Atomics.load(ctrl, SIGNAL);
-                wasm.merge_cv_tree(outPtr, totalCvs, outPtr);
-            }
-
-            return {
-                totalCvs,
-                chosenSliceSize: totalCvs > 1
-                    ? Atomics.load(ctrl, SLICE_SIZE)
-                    : 0,
-            };
-        } finally {
-            busy = false;
-        }
+    function hashParallelBytesManual(input, totalThreads, sliceSize) {
+        assert(sliceSize !== 0, 'sliceSize must be non-zero');
+        return hashParallelBytes(input, totalThreads, sliceSize);
     }
 
     function hash(input) {
@@ -200,14 +199,15 @@ export default async function init() {
         return digestHex();
     }
 
-    async function hashParallel(input) {
-        await hashParallelBytes(input);
+    async function hashParallel(input, totalThreads, sliceSize = 0) {
+        await hashParallelBytes(input, totalThreads, sliceSize);
         return digestHex();
     }
 
     return {
-        maxData: MAX_DATA,
+        maxData: DATA_BUF_SIZE,
         maxThreads: MAX_THREADS,
+        maxCvs: MAX_SLICES,
         hash,
         hashParallel,
         hashBytes,
