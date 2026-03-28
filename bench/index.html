@@ -12,19 +12,31 @@
        max-width: 1400px;
        margin: 0 auto;
      }
-     h1, h2 { color: #1d4ed8; }
-     table { border-collapse: collapse; margin: 10px 0; }
+
+     h1, h2 {
+       color: #1d4ed8;
+     }
+
+     table {
+       border-collapse: collapse;
+       margin: 10px 0;
+     }
+
      th, td {
        border: 1px solid #d1d5db;
        padding: 4px 12px;
        text-align: right;
        font-family: monospace;
      }
+
      th {
        background: #e0e7ff;
        color: #1e3a8a;
      }
-     td:first-child, th:first-child { text-align: left; }
+
+     td:first-child, th:first-child {
+       text-align: left;
+     }
 
      button {
        font-size: 16px;
@@ -32,6 +44,7 @@
        margin: 5px 5px 5px 0;
        cursor: pointer;
      }
+
      button:disabled {
        opacity: 0.4;
        cursor: default;
@@ -54,10 +67,51 @@
        border: 1px solid #d1d5db;
      }
 
-     .cell-win  { background-color: #dcfce7; color: #166534; }
-     .cell-lose { background-color: #fee2e2; color: #b91c1c; }
-     .dim { color: #6b7280; font-size: 0.85em; }
-     .err { color: #b91c1c; font-weight: bold; }
+     .cell-win {
+       background-color: #dcfce7;
+       color: #166534;
+     }
+
+     .cell-lose {
+       background-color: #fee2e2;
+       color: #b91c1c;
+     }
+
+     .cell-fallback {
+       background-color: #f3f4f6;
+       color: #9ca3af;
+     }
+
+     .dim {
+       color: #6b7280;
+       font-size: 0.85em;
+     }
+
+     .err {
+       color: #b91c1c;
+       font-weight: bold;
+     }
+
+     .tables-grid {
+       display: grid;
+       grid-template-columns: 1fr;
+       gap: 16px;
+       align-items: start;
+     }
+
+     .slice-panel {
+       background: #fff;
+       border: 1px solid #d1d5db;
+       border-radius: 8px;
+       padding: 10px;
+       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+       overflow-x: auto;
+     }
+
+     .slice-panel table {
+       width: max-content;
+       min-width: 100%;
+     }
     </style>
   </head>
   <body>
@@ -65,18 +119,32 @@
 
     <p>
       Shared-memory WASM with Rust-side dispatch and worker orchestration.<br>
-      JS does only browser-mandated glue: load WASM, create workers, wait on atomics, render tables.
+      JS does only browser-mandated glue: load WASM, create workers, wait on
+      atomics, render tables.
     </p>
 
-    <p>Cores: <span id="cores"></span></p>
+    <p>Configured threads: 8</p>
 
-    <button id="btn-run" onclick="window.runBenchmarks(false)">Run Benchmarks</button>
-    <button id="btn-quick" onclick="window.runBenchmarks(true)">Quick Run (fewer measurements)</button>
+    <button id="btn-run" onclick="window.runBenchmarks(false)">
+      Run Benchmarks
+    </button>
+    <button id="btn-quick" onclick="window.runBenchmarks(true)">
+      Quick Run (fewer measurements)
+    </button>
 
     <div id="status"></div>
 
     <h2>Main-Thread Benchmarks — BLAKE3 vs WebCrypto SHA-256 (1T)</h2>
     <div id="main-results"></div>
+
+    <h2>Manual Plan Sweep Benchmarks</h2>
+    <p class="dim">
+      One table per minimum slice size.<br>
+      Each cell shows time/byte and ratio vs SHA-256.<br>
+      Grey means the request fell back to direct 1-thread hashing because it was
+      too small to split.
+    </p>
+    <div id="manual-results"></div>
 
     <h2>Rust-Planner Benchmarks</h2>
     <div id="planner-results"></div>
@@ -84,10 +152,7 @@
     <pre id="log"></pre>
 
     <script type="module">
-     const WASM_URL = '../target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm';
-     const WORKER_URL = '../hash-worker.js';
-     const CV_LEN = 32;
-     const WASM_PAGES = 32768;
+     import initHasher from '../multithreading-hasher.js';
 
      const DATA_SIZES = [
        64,
@@ -106,41 +171,39 @@
        2000000,
      ];
 
+     const THREAD_COUNTS = [1, 2, 3, 4, 5, 6, 7, 8];
+
+     const VERIFY_SIZES = [
+       64,
+       16385,
+       160 * 1024,
+       262208,
+       384 * 1024,
+       2000000,
+     ];
+
+     const SLICE_SIZES = [
+       4 * 1024,
+       8 * 1024,
+       16 * 1024,
+       32 * 1024,
+       64 * 1024,
+     ];
+
      const MEAS_FULL = 9;
      const MEAS_QUICK = 5;
 
-     const SLICE  = 1;
-     const ACTIVE = 2;
-     const SIGNAL = 4;
-     const READY = 6;
+     const HEX = Array.from(
+       { length: 256 },
+       (_, i) => (i + 256).toString(16).slice(1),
+     );
 
      const logEl = document.getElementById('log');
      const statusEl = document.getElementById('status');
      const mainResultsEl = document.getElementById('main-results');
+     const manualResultsEl = document.getElementById('manual-results');
      const plannerResultsEl = document.getElementById('planner-results');
 
-     document.getElementById('cores').textContent = navigator.hardwareConcurrency || '?';
-
-     let wasmModule;
-     let wasmMemory;
-     let wasmExports;
-
-     let ctrlPtr;
-     let dataPtr;
-     let outPtr;
-     let stacksBase;
-     let stackSize;
-
-     let ctrlI32;
-     let sha256Data;
-     let signalSeen = 0;
-
-     let maxData = 0;
-     let maxSlices = 0;
-     let maxThreads = 0;
-     let ctrlWords = 0;
-
-     const workers = [];
      const logLines = [];
 
      function assert(cond, msg) {
@@ -180,8 +243,12 @@
      }
 
      function fmtSize(bytes) {
-       if (bytes >= 1048576 && bytes % 1048576 === 0) return (bytes / 1048576) + ' MiB';
-       if (bytes >= 1024 && bytes % 1024 === 0) return (bytes / 1024) + ' KiB';
+       if (bytes >= 1048576 && bytes % 1048576 === 0) {
+         return (bytes / 1048576) + ' MiB';
+       }
+       if (bytes >= 1024 && bytes % 1024 === 0) {
+         return (bytes / 1024) + ' KiB';
+       }
        return bytes.toLocaleString() + ' B';
      }
 
@@ -189,19 +256,32 @@
        return ratio > 1.10 ? 'cell-win' : ratio < 0.90 ? 'cell-lose' : '';
      }
 
-     function hex(buf) {
-       return Array.from(new Uint8Array(buf))
-                   .map(b => b.toString(16).padStart(2, '0'))
-                   .join('');
+     function hex(bytes) {
+       let s = '';
+       for (let i = 0; i < bytes.length; i++) s += HEX[bytes[i]];
+       return s;
+     }
+
+     function bestOf(candidates) {
+       let best = null;
+       for (const c of candidates) {
+         if (!c || c.err || c.skip || c.ms == null) continue;
+         if (!best || c.ms < best.ms) best = c;
+       }
+       return best;
      }
 
      function calibrateSync(fn, targetMs) {
-       fn(); fn(); fn();
+       fn();
+       fn();
+       fn();
+
        const probe = 5;
        const t0 = performance.now();
        for (let i = 0; i < probe; i++) fn();
        const elapsed = performance.now() - t0;
        const perIter = elapsed / probe;
+
        if (perIter < 0.001) return Math.ceil(targetMs / 0.020);
        return Math.max(3, Math.ceil(targetMs / perIter));
      }
@@ -209,20 +289,26 @@
      function measureSync(fn, numMeasurements, targetMs) {
        const iters = calibrateSync(fn, targetMs);
        const times = [];
+
        for (let m = 0; m < numMeasurements; m++) {
          const t0 = performance.now();
          for (let i = 0; i < iters; i++) fn();
          times.push((performance.now() - t0) / iters);
        }
+
        times.sort((a, b) => a - b);
        return { ms: times[times.length >> 1], iters };
      }
 
      async function calibrateAsync(fn, targetMs) {
-       await fn(); await fn(); await fn();
+       await fn();
+       await fn();
+       await fn();
+
        const t0 = performance.now();
        await fn();
        const elapsed = performance.now() - t0;
+
        if (elapsed < 0.001) return Math.ceil(targetMs / 0.020);
        return Math.max(2, Math.ceil(targetMs / elapsed));
      }
@@ -230,139 +316,15 @@
      async function measureAsync(fn, numMeasurements, targetMs) {
        const iters = await calibrateAsync(fn, targetMs);
        const times = [];
+
        for (let m = 0; m < numMeasurements; m++) {
          const t0 = performance.now();
          for (let i = 0; i < iters; i++) await fn();
          times.push((performance.now() - t0) / iters);
        }
+
        times.sort((a, b) => a - b);
        return { ms: times[times.length >> 1], iters };
-     }
-
-     async function initWasm() {
-       const resp = await fetch(WASM_URL);
-       const bytes = await resp.arrayBuffer();
-
-       wasmModule = await WebAssembly.compile(bytes);
-       wasmMemory = new WebAssembly.Memory({
-         initial: WASM_PAGES,
-         maximum: WASM_PAGES,
-         shared: true,
-       });
-
-       const { exports } = await WebAssembly.instantiate(wasmModule, {
-         env: { memory: wasmMemory },
-       });
-
-       wasmExports = exports;
-
-       assert(typeof wasmExports.layout_ctrl_ptr === 'function', 'missing layout_ctrl_ptr');
-       assert(typeof wasmExports.layout_data_ptr === 'function', 'missing layout_data_ptr');
-       assert(typeof wasmExports.layout_out_ptr === 'function', 'missing layout_out_ptr');
-       assert(typeof wasmExports.layout_stacks_base === 'function', 'missing layout_stacks_base');
-       assert(typeof wasmExports.config_max_data === 'function', 'missing config_max_data');
-       assert(typeof wasmExports.config_max_slices === 'function', 'missing config_max_slices');
-       assert(typeof wasmExports.config_max_threads === 'function', 'missing config_max_threads');
-       assert(typeof wasmExports.config_ctrl_words === 'function', 'missing config_ctrl_words');
-       assert(typeof wasmExports.config_stack_size === 'function', 'missing config_stack_size');
-       assert(typeof wasmExports.blake3_hash === 'function', 'missing blake3_hash');
-       assert(typeof wasmExports.dispatch_auto === 'function', 'missing dispatch_auto');
-       assert(typeof wasmExports.merge_cv_tree === 'function', 'missing merge_cv_tree');
-       assert(typeof Atomics.waitAsync === 'function', 'missing Atomics.waitAsync');
-
-       ctrlPtr = wasmExports.layout_ctrl_ptr();
-       dataPtr = wasmExports.layout_data_ptr();
-       outPtr = wasmExports.layout_out_ptr();
-       stacksBase = wasmExports.layout_stacks_base();
-
-       maxData = wasmExports.config_max_data();
-       maxSlices = wasmExports.config_max_slices();
-       maxThreads = wasmExports.config_max_threads();
-       ctrlWords = wasmExports.config_ctrl_words();
-       stackSize = wasmExports.config_stack_size();
-
-       ctrlI32 = new Int32Array(wasmMemory.buffer, ctrlPtr, ctrlWords);
-
-       const heap = new Uint8Array(wasmMemory.buffer);
-       for (let i = 0; i < maxData; i++) heap[dataPtr + i] = i & 255;
-
-       sha256Data = new Uint8Array(maxData);
-       sha256Data.set(heap.subarray(dataPtr, dataPtr + maxData));
-
-       signalSeen = Atomics.load(ctrlI32, SIGNAL);
-
-       log('Shared WASM layout:');
-       log(`  ctrl     @ ${ctrlPtr}`);
-       log(`  data     @ ${dataPtr}`);
-       log(`  out      @ ${outPtr} (${maxSlices * CV_LEN} bytes)`);
-       log(`  threads  @ ${maxThreads}`);
-       log(`  stacks   @ ${stacksBase}`);
-       log(`  stacksz  @ ${stackSize}`);
-     }
-
-     function spawnWorkers() {
-       assert(workers.length === 0, 'workers already spawned');
-       for (let i = 0; i < maxThreads - 1; i++) {
-         const worker = new Worker(new URL(WORKER_URL, import.meta.url), { type: 'module' });
-         worker.postMessage({
-           wasmModule,
-           memory: wasmMemory,
-           index: i,
-           ctrlPtr,
-           dataPtr,
-           stackPtr: stacksBase + (i + 1) * stackSize,
-           cvPtr: outPtr,
-         });
-         workers.push(worker);
-       }
-     }
-
-     async function waitUntilAtLeast(ctrl, idx, target) {
-       while (Atomics.load(ctrl, idx) < target) {
-         const cur = Atomics.load(ctrl, idx);
-         const r = Atomics.waitAsync(ctrl, idx, cur);
-         if (r.async) await r.value;
-       }
-     }
-
-     async function waitForSignalChange(expected) {
-       await Atomics.waitAsync(ctrlI32, SIGNAL, expected).value;
-     }
-
-     function readDigestHex() {
-       return hex(new Uint8Array(wasmMemory.buffer, outPtr, CV_LEN));
-     }
-
-     function hashBlake3(bytes) {
-       wasmExports.blake3_hash(dataPtr, bytes, outPtr);
-     }
-
-     async function hashSha256(bytes) {
-       const view = sha256Data.subarray(0, bytes);
-       await crypto.subtle.digest('SHA-256', view);
-     }
-
-     async function runRustPlanner(bytes) {
-       const expected = signalSeen;
-       const totalCvs = wasmExports.dispatch_auto(ctrlPtr, dataPtr, bytes, outPtr);
-
-       if (totalCvs > 1) {
-         await waitForSignalChange(expected);
-         signalSeen = Atomics.load(ctrlI32, SIGNAL);
-         wasmExports.merge_cv_tree(outPtr, totalCvs, outPtr);
-       }
-
-       return totalCvs;
-     }
-
-     async function probeRustPlanner(bytes) {
-       const totalCvs = await runRustPlanner(bytes);
-       return {
-         totalCvs,
-         sliceSize: Atomics.load(ctrlI32, SLICE),
-         threads: Atomics.load(ctrlI32, ACTIVE) + 1,
-         direct: totalCvs === 1,
-       };
      }
 
      async function verifyRustPlannerCorrectness(bytes) {
@@ -373,8 +335,21 @@
        const got = readDigestHex();
 
        assert(ref === got, `planner mismatch at ${bytes}`);
-
        return meta;
+     }
+
+     async function verifyMtCorrectness(totalThreads, bytes, minSliceSize) {
+       hashBlake3(bytes);
+       const ref = readDigestHex();
+
+       await hashParallel(bytes, totalThreads, minSliceSize);
+       const got = readDigestHex();
+
+       assert(
+         ref === got,
+         `${totalThreads}T mismatch at ${fmtSize(bytes)} with min-slice `
+         + `${fmtSize(minSliceSize)}`,
+       );
      }
 
      function renderMainTable(rows) {
@@ -404,6 +379,148 @@
 
        html += '</table>';
        mainResultsEl.innerHTML = html;
+     }
+
+     function renderManualTables(sliceMatrices, b3Baseline, shaBaseline) {
+       let html = '<div class="tables-grid">';
+
+       for (let bi = 0; bi < SLICE_SIZES.length; bi++) {
+         const minSliceSize = SLICE_SIZES[bi];
+         const matrix = sliceMatrices[bi];
+
+         html += `<section class="slice-panel">`;
+         html += `<h3>Minimum slice size: ${fmtSize(minSliceSize)}</h3>`;
+         html += '<table><tr><th>Size╲Threads</th>';
+
+         for (const t of THREAD_COUNTS) {
+           html += `<th>${t}T</th>`;
+         }
+         html += '<th>Best</th>';
+         html += '</tr>';
+
+         for (let si = 0; si < DATA_SIZES.length; si++) {
+           const bytes = DATA_SIZES[si];
+           const rowCandidates = [];
+
+           html += `<tr><td>${fmtSize(bytes)}</td>`;
+
+           for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
+             const threadCount = THREAD_COUNTS[ti];
+             const cell = matrix[si]?.[ti];
+
+             if (!cell) {
+               html += '<td>—</td>';
+               continue;
+             }
+
+             if (cell.err) {
+               html += `<td class="err" title="${cell.err}">❌</td>`;
+               continue;
+             }
+
+             if (cell.skip) {
+               html += '<td class="cell-fallback"><span class="dim">=1T</span></td>';
+               continue;
+             }
+
+             const ratio = shaBaseline[si] / cell.ms;
+             rowCandidates.push({
+               ...cell,
+               threadCount,
+               minSliceSize,
+             });
+
+             html += `<td class="${cellClass(ratio)}">`
+                   + `${fmtTimePerByte(cell.ms, bytes)}<br>`
+                   + `<span class="dim">${ratio.toFixed(2)}× vs SHA</span><br>`
+                   + `<span class="dim">${cell.cvs} CV`
+                   + (threadCount === 1
+                    ? ' · direct'
+                    : ` · chose ${fmtSize(cell.chosenSliceSize)}`)
+                   + `</span>`
+                   + `</td>`;
+           }
+
+           const best = bestOf(rowCandidates);
+           if (!best) {
+             html += '<td>—</td>';
+           } else {
+             const ratio = shaBaseline[si] / best.ms;
+             html += `<td class="${cellClass(ratio)}">`
+                   + `${fmtTimePerByte(best.ms, bytes)}<br>`
+                   + `<span class="dim">${ratio.toFixed(2)}× vs SHA</span><br>`
+                   + `<span class="dim">${best.threadCount}T`
+                   + (best.threadCount === 1
+                    ? ' · direct'
+                    : ` · chose ${fmtSize(best.chosenSliceSize)}`)
+                   + `</span>`
+                   + `</td>`;
+           }
+
+           html += '</tr>';
+         }
+
+         html += '</table>';
+         html += '</section>';
+       }
+
+       html += `<section class="slice-panel" style="grid-column: 1 / -1;">`;
+       html += `<h3>Overall best by input size</h3>`;
+       html += `<table><tr>`
+             + `<th>Data Size</th>`
+             + `<th>Best</th>`
+             + `<th>Minimum slice size</th>`
+             + `<th>Threads</th>`
+             + `<th>Chosen slice size</th>`
+             + `<th>CVs</th>`
+             + `</tr>`;
+
+       for (let si = 0; si < DATA_SIZES.length; si++) {
+         const bytes = DATA_SIZES[si];
+         const candidates = [{
+           ms: b3Baseline[si],
+           cvs: 1,
+           threadCount: 1,
+           minSliceSize: 0,
+           chosenSliceSize: 0,
+         }];
+
+         for (let bi = 0; bi < SLICE_SIZES.length; bi++) {
+           for (let ti = 1; ti < THREAD_COUNTS.length; ti++) {
+             const cell = sliceMatrices[bi][si]?.[ti];
+             if (!cell || cell.err || cell.skip || cell.ms == null) continue;
+             candidates.push({
+               ...cell,
+               threadCount: THREAD_COUNTS[ti],
+               minSliceSize: SLICE_SIZES[bi],
+             });
+           }
+         }
+
+         const best = bestOf(candidates);
+         const ratio = shaBaseline[si] / best.ms;
+         const cls = cellClass(ratio);
+
+         html += `<tr>`
+               + `<td>${fmtSize(bytes)}</td>`
+               + `<td class="${cls}"><b>${fmtTimePerByte(best.ms, bytes)}</b><br>`
+               + `<span class="dim">${ratio.toFixed(2)}× vs SHA</span></td>`
+               + `<td class="${cls}">`
+               + `${best.threadCount === 1 ? '—' : fmtSize(best.minSliceSize)}`
+               + `</td>`
+               + `<td class="${cls}">${best.threadCount}T</td>`
+               + `<td class="${cls}">`
+               + `${best.threadCount === 1 ? 'direct' : fmtSize(best.chosenSliceSize)}`
+               + `</td>`
+               + `<td class="${cls}">${best.cvs}</td>`
+               + `</tr>`;
+       }
+
+       html += '</table>';
+       html += '</section>';
+       html += '</div>';
+
+       manualResultsEl.innerHTML = html;
      }
 
      function renderPlannerTable(rows) {
@@ -444,7 +561,7 @@
      async function runBenchmarks(quick = false) {
        const btnRun = document.getElementById('btn-run');
        const btnQuick = document.getElementById('btn-quick');
-       const targetMs = quick ? 40 : 200;
+       const targetMs = quick ? 10 : 100;
        const numM = quick ? MEAS_QUICK : MEAS_FULL;
 
        btnRun.disabled = true;
@@ -452,6 +569,7 @@
 
        logLines.length = 0;
        mainResultsEl.innerHTML = '';
+       manualResultsEl.innerHTML = '';
        plannerResultsEl.innerHTML = '';
        logEl.textContent = '';
 
@@ -460,18 +578,35 @@
          await initWasm();
 
          setStatus('Spawning workers…');
-         spawnWorkers();
-         if (maxThreads > 1) {
-           await waitUntilAtLeast(ctrlI32, READY, maxThreads - 1);
-         }
+         await spawnWorkers();
 
          const baselineByBytes = new Map();
          const mainRows = [];
+         const b3Baseline = [];
+         const shaBaseline = [];
+
+         if (THREAD_COUNTS.length > 1) {
+           log('');
+           log('── Manual multithread correctness verification ──');
+
+           for (const minSliceSize of SLICE_SIZES) {
+             log(`  minimum slice size ${fmtSize(minSliceSize)}`);
+             for (const t of THREAD_COUNTS) {
+               if (t === 1) continue;
+               for (const bytes of VERIFY_SIZES) {
+                 await verifyMtCorrectness(t, bytes, minSliceSize);
+                 log(`    ✓ ${t}T ${fmtSize(bytes)}`);
+               }
+             }
+           }
+
+           flushLog();
+         }
 
          setStatus('Running main-thread benchmarks…');
 
          for (const bytes of DATA_SIZES) {
-           assert(bytes <= maxData, `size exceeds maxData: ${bytes}`);
+           assert(bytes <= MAX_DATA, `size exceeds MAX_DATA: ${bytes}`);
 
            const direct = measureSync(() => hashBlake3(bytes), numM, targetMs);
            const sha = await measureAsync(() => hashSha256(bytes), numM, targetMs);
@@ -487,24 +622,113 @@
 
            baselineByBytes.set(bytes, row);
            mainRows.push(row);
+           b3Baseline.push(direct.ms);
+           shaBaseline.push(sha.ms);
 
            const b3vsSha = sha.ms / direct.ms;
            log(
-             `${fmtSize(bytes).padStart(10)}  ` +
-             `b3 ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)  ` +
-             `${fmtTimePerByte(direct.ms, bytes)}  ` +
-             `sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters} iters)  ` +
-             `${fmtTimePerByte(sha.ms, bytes)}  ` +
-             `b3-vs-sha ${b3vsSha.toFixed(2)}×`
+             `${fmtSize(bytes).padStart(10)}  `
+             + `b3 ${fmtMs(direct.ms).padStart(10)} (${direct.iters} iters)  `
+             + `${fmtTimePerByte(direct.ms, bytes)}  `
+             + `sha256 ${fmtMs(sha.ms).padStart(10)} (${sha.iters} iters)  `
+             + `${fmtTimePerByte(sha.ms, bytes)}  `
+             + `b3-vs-sha ${b3vsSha.toFixed(2)}×`
            );
          }
 
          renderMainTable(mainRows);
          flushLog();
 
+         setStatus('Running manual plan sweep benchmarks…');
+
+         const sliceMatrices = SLICE_SIZES.map(() => DATA_SIZES.map(() => []));
+
+         for (let bi = 0; bi < SLICE_SIZES.length; bi++) {
+           const minSliceSize = SLICE_SIZES[bi];
+
+           log('');
+           log(`── Minimum slice size ${fmtSize(minSliceSize)} ──`);
+
+           for (let ti = 0; ti < THREAD_COUNTS.length; ti++) {
+             const threadCount = THREAD_COUNTS[ti];
+
+             if (threadCount === 1) {
+               for (let si = 0; si < DATA_SIZES.length; si++) {
+                 sliceMatrices[bi][si][ti] = {
+                   ms: b3Baseline[si],
+                   cvs: 1,
+                   chosenSliceSize: 0,
+                 };
+               }
+               renderManualTables(sliceMatrices, b3Baseline, shaBaseline);
+               continue;
+             }
+
+             for (let si = 0; si < DATA_SIZES.length; si++) {
+               const bytes = DATA_SIZES[si];
+
+               try {
+                 const probe = await hashParallel(bytes, threadCount, minSliceSize);
+
+                 if (probe.totalCvs < 2) {
+                   sliceMatrices[bi][si][ti] = { skip: true };
+                   log(
+                     `  ${fmtSize(bytes).padStart(12)} × `
+                     + `${threadCount}T @ ${fmtSize(minSliceSize).padStart(8)}`
+                     + `  -> =1T`
+                   );
+                   continue;
+                 }
+
+                 const result = await measureAsync(
+                   () => hashParallel(bytes, threadCount, minSliceSize),
+                   numM,
+                   targetMs,
+                 );
+
+                 sliceMatrices[bi][si][ti] = {
+                   ms: result.ms,
+                   cvs: probe.totalCvs,
+                   chosenSliceSize: probe.chosenSliceSize,
+                 };
+
+                 const vsSha = shaBaseline[si] / result.ms;
+                 const vs1T = b3Baseline[si] / result.ms;
+
+                 log(
+                   `  ${fmtSize(bytes).padStart(12)} × `
+                   + `${threadCount}T @ ${fmtSize(minSliceSize).padStart(8)}`
+                   + `  ${fmtMs(result.ms).padStart(10)} (${result.iters})`
+                   + `  ${fmtTimePerByte(result.ms, bytes)}`
+                   + `  ${vsSha.toFixed(2)}× vs SHA`
+                   + `  ${vs1T.toFixed(2)}× vs 1T`
+                   + `  ${probe.totalCvs} CV`
+                   + `  chose ${fmtSize(probe.chosenSliceSize)}`
+                 );
+               } catch (e) {
+                 sliceMatrices[bi][si][ti] = {
+                   err: e.message || String(e),
+                 };
+
+                 log(
+                   `  ${fmtSize(bytes).padStart(12)} × `
+                   + `${threadCount}T @ ${fmtSize(minSliceSize).padStart(8)}`
+                   + `  ❌ ${e.message || e}`
+                 );
+               }
+             }
+
+             renderManualTables(sliceMatrices, b3Baseline, shaBaseline);
+             flushLog();
+           }
+         }
+
+         renderManualTables(sliceMatrices, b3Baseline, shaBaseline);
+         flushLog();
+
          const plannerRows = [];
 
-         setStatus('Running planner benchmarks…');
+         setStatus('Running Rust planner benchmarks…');
 
          for (const bytes of DATA_SIZES) {
            const baseline = baselineByBytes.get(bytes);
@@ -537,16 +761,18 @@
            const vs1T = row.directMs / row.plannerMs;
 
            log(
-             `${fmtSize(bytes).padStart(10)}  ` +
-             `planner ${fmtMs(row.plannerMs).padStart(10)} (${planner.iters} iters)  ` +
-             `${fmtTimePerByte(row.plannerMs, bytes)}  ` +
-             `vs-sha ${vsSha.toFixed(2)}×  ` +
-             `vs-b3-1t ${vs1T.toFixed(2)}×  ` +
-             `${
-                row.direct
-                  ? '1T · direct'
-                  : `${row.threads}T · ${row.totalCvs} CV · slice ${fmtSize(row.sliceSize)}`
-              }`
+             `${fmtSize(bytes).padStart(10)}  `
+             + `planner ${fmtMs(row.plannerMs).padStart(10)} `
+             + `(${planner.iters} iters)  `
+             + `${fmtTimePerByte(row.plannerMs, bytes)}  `
+             + `vs-sha ${vsSha.toFixed(2)}×  `
+             + `vs-b3-1t ${vs1T.toFixed(2)}×  `
+             + `${
+               row.direct
+                 ? '1T · direct'
+                 : `${row.threads}T · ${row.totalCvs} CV · slice `
+                   + `${fmtSize(row.sliceSize)}`
+             }`
            );
          }
 
@@ -554,7 +780,8 @@
          flushLog();
 
          setStatus('Done!');
-         log('\n════ All benchmarks complete ════');
+         log('');
+         log('════ All benchmarks complete ════');
          flushLog();
        } catch (e) {
          setError(`Error: ${e.message || e}`);

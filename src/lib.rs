@@ -7,20 +7,16 @@ use blake3::hazmat::{
     Mode,
 };
 use core::{
-    mem,
     ptr,
     slice,
     sync::atomic::{AtomicI32, Ordering},
 };
 
-const CHUNK_LEN: usize = 1024;
+const CHUNK_SIZE: usize = 1024;
 const CV_SIZE: usize = 32;
 
-// Runtime/layout config.
-const MAX_DATA: usize = 2_000_000;
-
 // Total lanes including caller.
-const MAX_THREADS: usize = 4;
+const MAX_THREADS: usize = 8;
 const BG_WORKERS: usize = MAX_THREADS - 1;
 
 // Planner.
@@ -29,16 +25,9 @@ const SLICE_64K: usize = 64 * 1024;
 const SLICE_128K: usize = 128 * 1024;
 const SLICE_256K: usize = 256 * 1024;
 
-// At MAX_DATA with the planner below, this is enough.
-const MAX_SLICES: usize = 8;
+const MAX_SLICES: usize = MAX_THREADS * 4;
 
 const ALIGN: usize = 16;
-const PAGE: usize = 65536;
-const STACK_SIZE: usize = 65536;
-
-// ctrl layout: 7 × i32 in shared WASM memory
-const CTRL_WORDS: usize = 7;
-const CTRL_BYTES: usize = CTRL_WORDS * mem::size_of::<i32>();
 
 const GEN: usize = 0;
 const SLICE_SIZE: usize = 1;
@@ -105,62 +94,11 @@ fn leaf_count(total: usize, slice_size: usize) -> usize {
     (full / slice_size) + (tail != 0) as usize
 }
 
-// ── Layout/config exports ───────────────────────────────────
+// ── Layout export ───────────────────────────────────
 
 #[no_mangle]
 pub extern "C" fn layout_ctrl_ptr() -> usize {
     align_up(heap_base(), ALIGN)
-}
-
-#[no_mangle]
-pub extern "C" fn layout_data_ptr() -> usize {
-    align_up(layout_ctrl_ptr() + CTRL_BYTES, ALIGN)
-}
-
-#[no_mangle]
-pub extern "C" fn layout_out_ptr() -> usize {
-    align_up(layout_data_ptr() + MAX_DATA, ALIGN)
-}
-
-#[no_mangle]
-pub extern "C" fn layout_stacks_base() -> usize {
-    align_up(layout_out_ptr() + MAX_SLICES * CV_SIZE, ALIGN)
-}
-
-#[no_mangle]
-pub extern "C" fn layout_required_pages() -> usize {
-    let end = layout_stacks_base() + BG_WORKERS * STACK_SIZE;
-    (end + PAGE - 1) / PAGE
-}
-
-#[no_mangle]
-pub extern "C" fn config_max_data() -> u32 {
-    MAX_DATA as u32
-}
-
-#[no_mangle]
-pub extern "C" fn config_max_threads() -> u32 {
-    MAX_THREADS as u32
-}
-
-#[no_mangle]
-pub extern "C" fn config_max_slices() -> u32 {
-    MAX_SLICES as u32
-}
-
-#[no_mangle]
-pub extern "C" fn config_ctrl_words() -> u32 {
-    CTRL_WORDS as u32
-}
-
-#[no_mangle]
-pub extern "C" fn config_stack_size() -> u32 {
-    STACK_SIZE as u32
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn clear_ctrl(ctrl_ptr: *mut i32) {
-    ptr::write_bytes(ctrl_ptr, 0, CTRL_WORDS);
 }
 
 // ── Single-threaded full hash ───────────────────────────────
@@ -177,7 +115,7 @@ pub unsafe extern "C" fn blake3_hash(data_ptr: *const u8, data_len: usize, out_p
 #[inline(always)]
 unsafe fn hash_slice_cv_at(data: *const u8, len: usize, offset: u64, out: *mut u8) {
     assert!(len != 0);
-    assert!(offset.is_multiple_of(CHUNK_LEN as u64));
+    assert!(offset.is_multiple_of(CHUNK_SIZE as u64));
 
     let input = slice::from_raw_parts(data, len);
     let mut hasher = blake3::Hasher::new();
@@ -226,6 +164,59 @@ unsafe fn process_lane(
     }
 }
 
+#[inline(always)]
+unsafe fn dispatch_direct(
+    c: *mut i32,
+    data: *const u8,
+    total: usize,
+    cv: *mut u8,
+) -> u32 {
+    at(c, SLICE_SIZE).store(0, Ordering::Relaxed);
+    at(c, ACTIVE).store(0, Ordering::Relaxed);
+    at(c, DONE).store(0, Ordering::Relaxed);
+    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
+    blake3_hash(data, total, cv);
+    1
+}
+
+#[inline(always)]
+unsafe fn dispatch_parallel_fixed(
+    c: *mut i32,
+    data: *const u8,
+    total: usize,
+    cv: *mut u8,
+    slice_size: usize,
+    wanted_bg_workers: usize,
+) -> u32 {
+    if wanted_bg_workers == 0 {
+        return dispatch_direct(c, data, total, cv);
+    }
+
+    let total_cvs = leaf_count(total, slice_size);
+    if total_cvs < 2 {
+        return dispatch_direct(c, data, total, cv);
+    }
+
+    assert!(slice_size.is_power_of_two());
+    assert!(slice_size >= CHUNK_SIZE);
+
+    assert!(total_cvs <= MAX_SLICES);
+
+    let active = core::cmp::min(wanted_bg_workers, total_cvs - 1);
+    assert!(active <= BG_WORKERS);
+
+    at(c, SLICE_SIZE).store(slice_size as i32, Ordering::Relaxed);
+    at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
+    at(c, DONE).store(0, Ordering::Relaxed);
+    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
+
+    at(c, GEN).fetch_add(1, Ordering::AcqRel);
+    atomic_notify(c.add(GEN), u32::MAX);
+
+    process_lane(0, active + 1, slice_size, total, data, cv);
+    total_cvs as u32
+}
+
 // ── Worker loop ─────────────────────────────────────────────
 
 #[no_mangle]
@@ -264,7 +255,7 @@ pub unsafe extern "C" fn worker_loop(
         let total = at(c, TOTAL_LEN).load(Ordering::Relaxed) as usize;
 
         assert!(slice_size.is_power_of_two());
-        assert!(slice_size.is_multiple_of(CHUNK_LEN));
+        assert!(slice_size.is_multiple_of(CHUNK_SIZE));
 
         process_lane(lane, lanes, slice_size, total, data, cv);
 
@@ -278,6 +269,30 @@ pub unsafe extern "C" fn worker_loop(
 // ── Planner + dispatch ──────────────────────────────────────
 
 #[no_mangle]
+pub unsafe extern "C" fn dispatch(
+    c: *mut i32,
+    data: *const u8,
+    len: u32,
+    cv: *mut u8,
+    bg_workers: u32,
+    min_slice: u32,
+) -> u32 {
+    let total = len as usize;
+    let wanted_bg_workers = bg_workers as usize;
+    let mut slice_size = min_slice as usize;
+
+    assert!(wanted_bg_workers <= BG_WORKERS);
+    assert!(slice_size.is_power_of_two());
+    assert!(slice_size >= CHUNK_SIZE);
+
+    while leaf_count(total, slice_size) > MAX_SLICES {
+        slice_size <<= 1;
+    }
+
+    dispatch_parallel_fixed(c, data, total, cv, slice_size, wanted_bg_workers)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn dispatch_auto(
     c: *mut i32,
     data: *const u8,
@@ -285,41 +300,10 @@ pub unsafe extern "C" fn dispatch_auto(
     cv: *mut u8,
 ) -> u32 {
     let total = len as usize;
-    assert!(total <= MAX_DATA);
 
     let (slice_size, wanted_bg_workers) = choose_plan(total);
 
-    if wanted_bg_workers == 0 {
-        at(c, SLICE_SIZE).store(0, Ordering::Relaxed);
-        at(c, ACTIVE).store(0, Ordering::Relaxed);
-        at(c, DONE).store(0, Ordering::Relaxed);
-        at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
-        blake3_hash(data, total, cv);
-        return 1;
-    }
-
-    assert!(slice_size.is_power_of_two());
-    assert!(slice_size.is_multiple_of(CHUNK_LEN));
-
-    let total_cvs = leaf_count(total, slice_size);
-    assert!(total_cvs >= 2);
-    assert!(total_cvs <= MAX_SLICES);
-
-    let active = core::cmp::min(wanted_bg_workers, total_cvs - 1);
-    assert!(active >= 1);
-    assert!(active <= BG_WORKERS);
-
-    at(c, SLICE_SIZE).store(slice_size as i32, Ordering::Relaxed);
-    at(c, ACTIVE).store(active as i32, Ordering::Relaxed);
-    at(c, DONE).store(0, Ordering::Relaxed);
-    at(c, TOTAL_LEN).store(total as i32, Ordering::Relaxed);
-
-    at(c, GEN).fetch_add(1, Ordering::AcqRel);
-    atomic_notify(c.add(GEN), u32::MAX);
-
-    process_lane(0, active + 1, slice_size, total, data, cv);
-
-    total_cvs as u32
+    dispatch_parallel_fixed(c, data, total, cv, slice_size, wanted_bg_workers)
 }
 
 // ── Exact root merge for the current plan ───────────────────
