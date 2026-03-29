@@ -9,24 +9,44 @@
     <script src="coi-serviceworker.min.js"></script>
     <script type="module">
      import init from '../multithreading-hasher.js';
+
+     const HEX = Array.from({ length: 256 },
+       (_, i) => (i + 256).toString(16).slice(1));
+
+     function hex(bytes) {
+       let s = '';
+       for (let i = 0; i < bytes.length; i++)
+         s += HEX[bytes[i]];
+       return s;
+     }
+
+     const enc = new TextEncoder();
      const h = await init();
 
-     const smallInput = 'abcdefghihjl';
-     const largeInput = 'abcdefghihjl'.repeat(20000);
+     const smallText = 'abcdefghihjl';
+     const largeText = 'abcdefghihjl'.repeat(20000);
 
-     const smallDirect = h.hash(smallInput);
-     const smallParallel = await h.hashParallel(smallInput);
+     h.hashBytes(enc.encode(smallText));
+     const smallDirect = hex(h.digest);
 
-     const largeDirect = h.hash(largeInput);
-     const largeParallel = await h.hashParallel(largeInput);
+     const smallT =
+       await h.hashParallelBytes(enc.encode(smallText));
+     const smallParallel = hex(h.digest);
+
+     h.hashBytes(enc.encode(largeText));
+     const largeDirect = hex(h.digest);
+
+     const largeT =
+       await h.hashParallelBytes(enc.encode(largeText));
+     const largeParallel = hex(h.digest);
 
      document.getElementById('out').textContent =
-       `small input: ${smallInput}\n` +
+       `small input: ${smallText}\n` +
        `small direct:   ${smallDirect}\n` +
-       `small parallel: ${smallParallel}\n\n` +
-       `large input length: ${largeInput.length} bytes\n` +
+       `small parallel: ${smallParallel} (${smallT}T)\n\n` +
+       `large input length: ${largeText.length} bytes\n` +
        `large direct:   ${largeDirect}\n` +
-       `large parallel: ${largeParallel}\n`;
+       `large parallel: ${largeParallel} (${largeT}T)\n`;
     </script>
   </body>
 </html>
