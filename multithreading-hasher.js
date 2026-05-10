@@ -19,10 +19,8 @@ const CV_AREA_SIZE =
       (DATA_BUF_SIZE / SLICE_SIZE) * NODE_LEN;  // 2 MiB
 const WASM_PAGES = 1 << 14;               // 1 GiB, plenty of slack
 
-    //'./target/wasm32-unknown-unknown/debug/blake3_wasm_streaming.wasm',
-    // './target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm',
 const WASM_URL = new URL(
-    './target/wasm32-unknown-unknown/release/blake3_wasm_streaming.wasm',
+    './blake3_wasm_streaming.wasm',
     import.meta.url,
 );
 const WORKER_URL = new URL('./hash-worker.js', import.meta.url);

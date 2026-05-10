@@ -82,12 +82,10 @@
       Benchmarks <code>multithreading-hasher.js</code> with
       fixed 16 KiB slice size.
     </p>
+    <div id="gitmetadata"></div>
     <div id="config"></div>
-    <button id="btn-run" onclick="window.runBenchmarks(false)">
+    <button id="btn-run" onclick="window.runBenchmarks()">
       Run Benchmarks
-    </button>
-    <button id="btn-quick" onclick="window.runBenchmarks(true)">
-      Quick Run
     </button>
     <div id="status"></div>
 
@@ -103,6 +101,59 @@
     <pre id="log"></pre>
 
     <script type="module">
+     const res = await fetch('../gitmetadata.json', { cache: 'no-store' });
+     const meta = await res.json();
+
+     const gitEl = document.getElementById('gitmetadata');
+
+     function addLine(parts) {
+       if (parts.length === 0) return;
+       const div = document.createElement('div');
+       parts.forEach((part, i) => {
+         if (i > 0) div.append(' · ');
+         div.append(part);
+       });
+       gitEl.append(div);
+     }
+
+     function labeledLink(label, href, text) {
+       const frag = document.createDocumentFragment();
+       frag.append(`${label}: `);
+       const a = document.createElement('a');
+       a.href = href;
+       a.textContent = text;
+       frag.append(a);
+       return frag;
+     }
+
+     const line0 = [];
+     if (meta.timestamp) line0.push(`Build Timestamp: ${meta.timestamp}`);
+
+     const line1 = [];
+     if (meta.git_source) {
+       line1.push(labeledLink('Source', meta.git_source, meta.git_source));
+     }
+     if (meta.git_commit) {
+       const href = `${meta.git_source}/commit/${meta.git_commit}`;
+       line1.push(labeledLink('Commit', href, meta.git_commit));
+     }
+     if (meta.git_tag) line1.push(`Tag: ${meta.git_tag}`);
+
+     const line2 = [];
+     if (meta.git_clean_status) {
+       line2.push(`Git Clean Status: ${meta.git_clean_status}`);
+     }
+
+     const line3 = [];
+     if (navigator.userAgentData && navigator.userAgentData.platform) {
+       line3.push(`OS: ${navigator.userAgentData.platform}`);
+     }
+
+     addLine(line0);
+     addLine(line1);
+     addLine(line2);
+     addLine(line3);
+
      import initHasher from "../multithreading-hasher.js";
 
      const SLICE_SIZE = 16384;
@@ -140,7 +191,6 @@
      ];
 
      const MEAS_FULL = 9;
-     const MEAS_QUICK = 5;
 
      const logEl = document.getElementById("log");
      const statusEl = document.getElementById("status");
@@ -419,14 +469,13 @@
        plannerResultsEl.innerHTML = html;
      }
 
-     async function runBenchmarks(quick = false) {
+     async function runBenchmarks() {
        const btnRun = document.getElementById("btn-run");
-       const btnQuick = document.getElementById("btn-quick");
-       const targetMs = quick ? 10 : 100;
-       const numM = quick ? MEAS_QUICK : MEAS_FULL;
+       const targetMs = 100;
+       const numM = MEAS_FULL;
 
        btnRun.disabled = true;
-       btnQuick.disabled = true;
+
        logLines.length = 0;
        logEl.textContent = "";
        mainResultsEl.innerHTML = "";
@@ -443,7 +492,6 @@
 
          log(`library maxThreads = ${hasher.maxThreads}`);
          log(`library maxData    = ${fmtSize(hasher.maxData)}`);
-         log(`benchmark mode     = ${quick ? "quick" : "full"}`);
          flushLog();
 
          // ── Correctness verification ──
@@ -649,7 +697,6 @@
          console.error(e);
        } finally {
          btnRun.disabled = false;
-         btnQuick.disabled = false;
        }
      }
 
