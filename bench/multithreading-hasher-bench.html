@@ -131,6 +131,7 @@
 
      const VERIFY_SIZES = [
        64,
+       SLICE_SIZE,
        16385,
        160 * 1024,
        262208,
@@ -141,16 +142,6 @@
      const MEAS_FULL = 9;
      const MEAS_QUICK = 5;
 
-     const HEX = Array.from({ length: 256 },
-       (_, i) => (i + 256).toString(16).slice(1));
-
-     function hex(bytes) {
-       let s = '';
-       for (let i = 0; i < bytes.length; i++)
-         s += HEX[bytes[i]];
-       return s;
-     }
-
      const logEl = document.getElementById("log");
      const statusEl = document.getElementById("status");
      const configEl = document.getElementById("config");
@@ -160,7 +151,6 @@
 
      let hasher;
      const logLines = [];
-     const inputsByBytes = new Map();
 
      function assert(cond, msg) {
        if (!cond) throw new Error(msg);
@@ -189,24 +179,24 @@
        return (ms * 1e6).toFixed(0) + " ns";
      }
 
-     function fmtTimePerByte(ms, bytes) {
-       const nsB = (ms * 1e6) / bytes;
+     function fmtTimePerByte(ms, numbytes) {
+       const nsB = (ms * 1e6) / numbytes;
        if (nsB >= 1000) return (nsB / 1000).toFixed(2) + " µs/B";
        if (nsB >= 1) return nsB.toFixed(2) + " ns/B";
        return (nsB * 1000).toFixed(0) + " ps/B";
      }
 
-     function fmtSize(bytes) {
-       if (bytes >= 1048576 && bytes % 1048576 === 0)
-         return bytes / 1048576 + " MiB";
-       if (bytes >= 1024 && bytes % 1024 === 0)
-         return bytes / 1024 + " KiB";
-       return bytes.toLocaleString() + " B";
+     function fmtSize(numbytes) {
+       if (numbytes >= 1048576 && numbytes % 1048576 === 0)
+         return numbytes / 1048576 + " MiB";
+       if (numbytes >= 1024 && numbytes % 1024 === 0)
+         return numbytes / 1024 + " KiB";
+       return numbytes.toLocaleString() + " B";
      }
 
      function cellClass(ratio) {
        return ratio > 1.10 ? "cell-win"
-         : ratio < 0.90 ? "cell-lose" : "";
+                    : ratio < 0.90 ? "cell-lose" : "";
      }
 
      function bestOf(candidates) {
@@ -214,24 +204,6 @@
        for (let i = 1; i < candidates.length; i++)
          if (candidates[i].ms < best.ms) best = candidates[i];
        return best;
-     }
-
-     function canRunParallel(bytes, totalThreads) {
-       return bytes >= totalThreads * SLICE_SIZE;
-     }
-
-     function makeInput(bytes) {
-       const input = new Uint8Array(bytes);
-       for (let i = 0; i < bytes; i++) input[i] = i;
-       return input;
-     }
-
-     function getInput(bytes) {
-       let input = inputsByBytes.get(bytes);
-       if (input !== undefined) return input;
-       input = makeInput(bytes);
-       inputsByBytes.set(bytes, input);
-       return input;
      }
 
      async function initHasherOnce() {
@@ -243,28 +215,8 @@
          ", maxData = " + fmtSize(hasher.maxData);
      }
 
-     function directDigestHex(bytes) {
-       hasher.hashBytes(getInput(bytes));
-       return hex(hasher.digest);
-     }
-
-     async function parallelDigestHex(bytes, threads) {
-       const t = await hasher.hashParallelBytes(
-         getInput(bytes), threads);
-       return { hex: hex(hasher.digest), threads: t };
-     }
-
-     function hashBlake3(bytes) {
-       hasher.hashBytes(getInput(bytes));
-     }
-
-     async function hashSha256(bytes) {
-       await crypto.subtle.digest("SHA-256", getInput(bytes));
-     }
-
-     async function hashParallel(bytes, threads) {
-       return hasher.hashParallelBytes(
-         getInput(bytes), threads);
+     async function hashSha256(bytesbuf) {
+       await crypto.subtle.digest("SHA-256", bytesbuf);
      }
 
      function calibrateSync(fn, targetMs) {
@@ -311,23 +263,28 @@
        return { ms: times[times.length >> 1], iters };
      }
 
-     async function verifyManualCorrectness(bytes, threads) {
-       const expected = directDigestHex(bytes);
-       const { hex: got } =
-         await parallelDigestHex(bytes, threads);
-       assert(got === expected,
-         `manual mismatch ${bytes} ${threads}T: ` +
-         `expected ${expected}, got ${got}`);
+     function sameBytes(a, b) {
+       assert(a.length === b.length, 'length mismatch');
+       for (let i = 0; i < a.length; i++) {
+         if (a[i] !== b[i]) return false;
+       }
+       return true;
      }
 
-     async function verifyAutoCorrectness(bytes) {
-       const expected = directDigestHex(bytes);
-       const { hex: got, threads } =
-         await parallelDigestHex(bytes);
-       assert(got === expected,
-         `auto mismatch ${bytes}: ` +
-         `expected ${expected}, got ${got}`);
-       return threads;
+     async function verifyManualCorrectness(bytesbuf, threads) {
+       const expected = hasher.hashBytes(bytesbuf);
+       const got = await hasher.hashParallelBytes(bytesbuf, threads);
+
+       assert(sameBytes(got, expected),
+              `manual mismatch ${bytesbuf.length}B ${threads}T`);
+     }
+
+     async function verifyAutoCorrectness(bytesbuf) {
+       const expected = hasher.hashBytes(bytesbuf);
+       const got = await hasher.hashParallelBytes(bytesbuf);
+
+       assert(sameBytes(got, expected),
+              `auto mismatch ${bytesbuf.length}B`);
      }
 
      function renderMainTable(rows) {
@@ -347,9 +304,9 @@
          html += `<tr>
            <td>${r.sizeLabel}</td>
            <td>${fmtMs(r.directMs)}</td>
-           <td><b>${fmtTimePerByte(r.directMs, r.bytes)}</b></td>
+           <td><b>${fmtTimePerByte(r.directMs, r.numbytes)}</b></td>
            <td>${fmtMs(r.shaMs)}</td>
-           <td>${fmtTimePerByte(r.shaMs, r.bytes)}</b></td>
+           <td>${fmtTimePerByte(r.shaMs, r.numbytes)}</b></td>
            <td class="${cellClass(ratio)}"><b>${ratio.toFixed(2)}×</b></td>
            <td class="dim">${r.hashIters}</td>
            <td class="dim">${r.shaIters}</td>
@@ -360,18 +317,18 @@
      }
 
      function renderManualTable(threadCounts, matrix,
-       b3Baseline, shaBaseline)
+                                b3Baseline, shaBaseline)
      {
        let html = '<div class="tables-grid"><div class="slice-panel"><table><tr><th>Size</th>';
        for (const t of threadCounts) html += `<th>${t}T</th>`;
        html += '<th>Best</th></tr>';
 
        for (let si = 0; si < DATA_SIZES.length; si++) {
-         const bytes = DATA_SIZES[si];
+         const numbytes = DATA_SIZES[si];
          const candidates = [{
            ms: b3Baseline[si], threadCount: 1,
          }];
-         html += `<tr><td>${fmtSize(bytes)}</td>`;
+         html += `<tr><td>${fmtSize(numbytes)}</td>`;
 
          for (let ti = 0; ti < threadCounts.length; ti++) {
            const t = threadCounts[ti];
@@ -380,7 +337,7 @@
              const vsSha = shaBaseline[si] / ms;
              html += `<td class="${cellClass(vsSha)}">
                <b>${fmtMs(ms)}</b><br>
-               ${fmtTimePerByte(ms, bytes)}<br>
+               ${fmtTimePerByte(ms, numbytes)}<br>
                <span class="dim">${vsSha.toFixed(2)}× vs SHA</span><br>
                <span class="dim">1T baseline</span>
              </td>`;
@@ -398,10 +355,10 @@
            const vs1T = b3Baseline[si] / r.ms;
            html += `<td class="${cellClass(vsSha)}">
              <b>${fmtMs(r.ms)}</b><br>
-             ${fmtTimePerByte(r.ms, bytes)}<br>
+             ${fmtTimePerByte(r.ms, numbytes)}<br>
              <span class="dim">${vsSha.toFixed(2)}× vs SHA</span><br>
              <span class="dim">${vs1T.toFixed(2)}× vs 1T</span><br>
-             <span class="dim">${r.cvs} CV</span>
+             <span class="dim">${r.nodes} node${r.nodes === 1 ? '' : 's'}</span>
            </td>`;
          }
 
@@ -410,7 +367,7 @@
          const bestVs1T = b3Baseline[si] / best.ms;
          html += `<td class="${cellClass(bestVsSha)}">
            <b>${fmtMs(best.ms)}</b><br>
-           ${fmtTimePerByte(best.ms, bytes)}<br>
+           ${fmtTimePerByte(best.ms, numbytes)}<br>
            <span class="dim">${bestVsSha.toFixed(2)}× vs SHA</span><br>
            <span class="dim">${bestVs1T.toFixed(2)}× vs 1T</span><br>
            <span class="dim">${
@@ -434,7 +391,7 @@
            <th>vs SHA-256</th>
            <th>vs BLAKE3 1T</th>
            <th>Threads</th>
-           <th>CVs</th>
+           <th>Nodes</th>
            <th>Iters</th>
          </tr>`;
        for (const r of rows) {
@@ -451,11 +408,10 @@
          html += `<tr>
            <td>${r.sizeLabel}</td>
            <td>${fmtMs(r.autoMs)}</td>
-           <td><b>${fmtTimePerByte(r.autoMs, r.bytes)}</b></td>
+           <td><b>${fmtTimePerByte(r.autoMs, r.numbytes)}</b></td>
            <td class="${cellClass(vsSha)}"><b>${vsSha.toFixed(2)}×</b></td>
            <td><b>${vs1T.toFixed(2)}×</b></td>
-           <td>${r.threads}T</td>
-           <td>${r.totalCvs}</td>
+           <td>${r.totalNodes}</td>
            <td class="dim">${r.autoIters}</td>
          </tr>`;
        }
@@ -498,13 +454,9 @@
 
          for (const t of threadCounts) {
            if (t === 1) continue;
-           for (const bytes of VERIFY_SIZES) {
-             if (!canRunParallel(bytes, t)) {
-               log(`  - skip ${t}T ${fmtSize(bytes)}`);
-               continue;
-             }
-             await verifyManualCorrectness(bytes, t);
-             log(`  ✓ ${t}T ${fmtSize(bytes)}`);
+           for (const numbytes of VERIFY_SIZES) {
+             await verifyManualCorrectness(new Uint8Array(numbytes), t);
+             log(`  ✓ ${t}T ${fmtSize(numbytes)}`);
            }
          }
          flushLog();
@@ -513,13 +465,13 @@
          log("");
          log("── Auto correctness ──");
 
-         for (const bytes of VERIFY_SIZES) {
-           if (bytes < SLICE_SIZE * 2) {
-             log(`  - skip ${fmtSize(bytes).padStart(10)}  1T only`);
+         for (const numbytes of VERIFY_SIZES) {
+           if (numbytes < SLICE_SIZE * 2) {
+             log(`  - skip ${fmtSize(numbytes).padStart(10)}  1T only`);
              continue;
            }
-           const threads = await verifyAutoCorrectness(bytes);
-           log(`  ✓ ${fmtSize(bytes).padStart(10)}  ${threads}T`);
+           await verifyAutoCorrectness(new Uint8Array(numbytes));
+           log(`  ✓ ${fmtSize(numbytes).padStart(10)}`);
          }
          flushLog();
 
@@ -532,37 +484,37 @@
          const b3Baseline = [];
          const shaBaseline = [];
 
-         for (const bytes of DATA_SIZES) {
-           assert(bytes <= hasher.maxData,
-             `size exceeds maxData: ${bytes}`);
+         for (const numbytes of DATA_SIZES) {
+           assert(numbytes <= hasher.maxData,
+                  `size exceeds maxData: ${numbytes}`);
 
            const direct = measureSync(
-             () => hashBlake3(bytes), numM, targetMs);
+             () => hasher.hashBytes(new Uint8Array(numbytes)), numM, targetMs);
            const sha = await measureAsync(
-             () => hashSha256(bytes), numM, targetMs);
+             () => hashSha256(new Uint8Array(numbytes)), numM, targetMs);
 
            const row = {
-             bytes,
-             sizeLabel: fmtSize(bytes),
+             numbytes,
+             sizeLabel: fmtSize(numbytes),
              directMs: direct.ms,
              hashIters: direct.iters,
              shaMs: sha.ms,
              shaIters: sha.iters,
            };
 
-           baselineByBytes.set(bytes, row);
+           baselineByBytes.set(numbytes, row);
            mainRows.push(row);
            b3Baseline.push(direct.ms);
            shaBaseline.push(sha.ms);
 
            log(
-             `${fmtSize(bytes).padStart(10)}  ` +
+             `${fmtSize(numbytes).padStart(10)}  ` +
              `b3 ${fmtMs(direct.ms).padStart(10)} ` +
              `(${direct.iters} iters)  ` +
-             `${fmtTimePerByte(direct.ms, bytes)}  ` +
+             `${fmtTimePerByte(direct.ms, numbytes)}  ` +
              `sha256 ${fmtMs(sha.ms).padStart(10)} ` +
              `(${sha.iters} iters)  ` +
-             `${fmtTimePerByte(sha.ms, bytes)}  ` +
+             `${fmtTimePerByte(sha.ms, numbytes)}  ` +
              `b3-vs-sha ${(sha.ms / direct.ms).toFixed(2)}×`);
          }
 
@@ -579,53 +531,54 @@
            const threadCount = threadCounts[ti];
            if (threadCount === 1) {
              renderManualTable(threadCounts, matrix,
-               b3Baseline, shaBaseline);
+                               b3Baseline, shaBaseline);
              continue;
            }
 
            for (let si = 0; si < DATA_SIZES.length; si++) {
-             const bytes = DATA_SIZES[si];
+             const numbytes = DATA_SIZES[si];
 
-             if (!canRunParallel(bytes, threadCount)) {
+             if (numbytes <= (ti - 1) * SLICE_SIZE) {
                log(
-                 `  ${fmtSize(bytes).padStart(12)} × ` +
+                 `  ${fmtSize(numbytes).padStart(12)} × ` +
                  `${threadCount}T  -> skipped`);
                continue;
              }
 
-             const totalCvs =
-               (bytes + SLICE_SIZE - 1) >>> 14;
+             const totalNodes = numbytes >>> 14;
+
+             const bytesbuf = new Uint8Array(numbytes);
 
              const result = await measureAsync(
-               () => hashParallel(bytes, threadCount),
+               () => hasher.hashParallelBytes(bytesbuf),
                numM, targetMs);
 
              matrix[si][ti] = {
                ms: result.ms,
-               cvs: totalCvs,
+               nodes: totalNodes,
              };
 
              const vsSha = shaBaseline[si] / result.ms;
              const vs1T = b3Baseline[si] / result.ms;
 
              log(
-               `  ${fmtSize(bytes).padStart(12)} × ` +
+               `  ${fmtSize(numbytes).padStart(12)} × ` +
                `${threadCount}T` +
                `  ${fmtMs(result.ms).padStart(10)} ` +
                `(${result.iters})` +
-               `  ${fmtTimePerByte(result.ms, bytes)}` +
+               `  ${fmtTimePerByte(result.ms, numbytes)}` +
                `  ${vsSha.toFixed(2)}× vs SHA` +
                `  ${vs1T.toFixed(2)}× vs 1T` +
-               `  ${totalCvs} CV`);
+               `  ${totalNodes} node${totalNodes === 1 ? '' : 's'}`);
            }
 
            renderManualTable(threadCounts, matrix,
-             b3Baseline, shaBaseline);
+                             b3Baseline, shaBaseline);
            flushLog();
          }
 
          renderManualTable(threadCounts, matrix,
-           b3Baseline, shaBaseline);
+                           b3Baseline, shaBaseline);
          flushLog();
 
          // ── Auto thread count ──
@@ -635,39 +588,36 @@
          const autoRows = [];
 
          for (let si = 0; si < DATA_SIZES.length; si++) {
-           const bytes = DATA_SIZES[si];
-           const baseline = baselineByBytes.get(bytes);
+           const numbytes = DATA_SIZES[si];
+           const baseline = baselineByBytes.get(numbytes);
 
-           if (bytes < SLICE_SIZE * 2) {
+           if (numbytes < SLICE_SIZE * 2) {
              autoRows.push({
-               bytes,
-               sizeLabel: fmtSize(bytes),
+               numbytes,
+               sizeLabel: fmtSize(numbytes),
                skip: true,
              });
-             log(`${fmtSize(bytes).padStart(10)}  ` +
-               `auto  skipped  1T only`);
+             log(`${fmtSize(numbytes).padStart(10)}  ` +
+                 `auto  skipped  1T only`);
              continue;
            }
 
-           let probeThreads;
-           // warm up + get thread count
-           probeThreads = await hashParallel(bytes);
+           const totalNodes = numbytes >>> 14;
 
-           const totalCvs = (bytes + SLICE_SIZE - 1) >>> 14;
+           const bytesbuf = new Uint8Array(numbytes);
 
            const auto = await measureAsync(
-             () => hashParallel(bytes),
+             () => hasher.hashParallelBytes(bytesbuf),
              numM, targetMs);
 
            const row = {
-             bytes,
-             sizeLabel: fmtSize(bytes),
+             numbytes,
+             sizeLabel: fmtSize(numbytes),
              autoMs: auto.ms,
              autoIters: auto.iters,
              directMs: baseline.directMs,
              shaMs: baseline.shaMs,
-             totalCvs,
-             threads: probeThreads,
+             totalNodes,
            };
 
            autoRows.push(row);
@@ -676,13 +626,13 @@
            const vs1T = row.directMs / row.autoMs;
 
            log(
-             `${fmtSize(bytes).padStart(10)}  ` +
+             `${fmtSize(numbytes).padStart(10)}  ` +
              `auto ${fmtMs(row.autoMs).padStart(13)} ` +
              `(${row.autoIters} iters)  ` +
-             `${fmtTimePerByte(row.autoMs, bytes)}  ` +
+             `${fmtTimePerByte(row.autoMs, numbytes)}  ` +
              `vs-sha ${vsSha.toFixed(2)}×  ` +
              `vs-b3-1t ${vs1T.toFixed(2)}×  ` +
-             `${row.threads}T · ${row.totalCvs} CV`);
+             `${row.totalNodes} node${row.totalNodes === 1 ? '' : 's'}`);
          }
 
          renderAutoTable(autoRows);

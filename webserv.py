@@ -1,13 +1,8 @@
-#!/usr/bin/env python3
-import ssl
+#!/usr/bin/env pypy3
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
-HOST = "0.0.0.0"
+HOST = "127.0.0.1"
 PORT = 8038
-
-SERVER_NAME = "Donalds-MacBook-Pro.local"
-CERT_FILE = "dev.pem"
-KEY_FILE = "dev-key.pem"
 
 class COIHandler(SimpleHTTPRequestHandler):
     extensions_map = {
@@ -26,10 +21,5 @@ class COIHandler(SimpleHTTPRequestHandler):
 
 httpd = ThreadingHTTPServer((HOST, PORT), COIHandler)
 
-ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-print("about to load %s %s" % (CERT_FILE, KEY_FILE))
-ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
-httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
-
-print(f"Serving HTTPS on https://{SERVER_NAME}:{PORT}")
+print(f"Serving HTTP on http://localhost:{PORT}")
 httpd.serve_forever()
