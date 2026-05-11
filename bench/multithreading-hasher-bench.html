@@ -103,56 +103,75 @@
     <script type="module">
      const res = await fetch('../gitmetadata.json', { cache: 'no-store' });
      const meta = await res.json();
-
      const gitEl = document.getElementById('gitmetadata');
 
-     function addLine(parts) {
-       if (parts.length === 0) return;
+     function append(...parts) {
        const div = document.createElement('div');
-       parts.forEach((part, i) => {
+       parts.forEach((p, i) => {
          if (i > 0) div.append(' · ');
-         div.append(part);
+         div.append(p);
        });
        gitEl.append(div);
      }
 
-     function labeledLink(label, href, text) {
-       const frag = document.createDocumentFragment();
-       frag.append(`${label}: `);
+     function link(label, href, text) {
        const a = document.createElement('a');
        a.href = href;
        a.textContent = text;
-       frag.append(a);
-       return frag;
+       const f = document.createDocumentFragment();
+       f.append(`${label}: `, a);
+       return f;
      }
 
-     const line0 = [];
-     if (meta.timestamp) line0.push(`Build Timestamp: ${meta.timestamp}`);
-
-     const line1 = [];
-     if (meta.git_source) {
-       line1.push(labeledLink('Source', meta.git_source, meta.git_source));
-     }
-     if (meta.git_commit) {
-       const href = `${meta.git_source}/commit/${meta.git_commit}`;
-       line1.push(labeledLink('Commit', href, meta.git_commit));
-     }
-     if (meta.git_tag) line1.push(`Tag: ${meta.git_tag}`);
-
-     const line2 = [];
-     if (meta.git_clean_status) {
-       line2.push(`Git Clean Status: ${meta.git_clean_status}`);
+     function browserFromUA(ua) {
+       const pats = [
+         [/Firefox\/(\S+)/, 'Firefox'],
+         [/Edg\/(\S+)/, 'Edge'],
+         [/Chrome\/(\S+)/, 'Chrome'],
+         [/Version\/(\S+).*Safari/, 'Safari'],
+       ];
+       for (const [re, name] of pats) {
+         const m = ua.match(re);
+         if (m) return `${name} ${m[1]}`;
+       }
+       return 'Unknown';
      }
 
-     const line3 = [];
-     if (navigator.userAgentData && navigator.userAgentData.platform) {
-       line3.push(`OS: ${navigator.userAgentData.platform}`);
-     }
+     append('— Build —');
+     append(`Timestamp: ${meta.timestamp}`);
+     append(
+       link('Source', meta.git_source, meta.git_source),
+       link('Commit',
+            `${meta.git_source}/commit/${meta.git_commit}`,
+            meta.git_commit),
+     );
+     if (meta.git_tag) append(`Tag: ${meta.git_tag}`);
 
-     addLine(line0);
-     addLine(line1);
-     addLine(line2);
-     addLine(line3);
+     append(`Git Clean Status: ${meta.git_clean_status}`);
+
+     append('— Runtime —');
+     const ua = navigator.userAgentData;
+     const rt = [
+       `OS: ${ua?.platform ?? navigator.platform}`,
+       `Logical cores: ${navigator.hardwareConcurrency}`,
+     ];
+     if (!ua?.brands) {
+       rt.push(`Browser: ${browserFromUA(navigator.userAgent)}`);
+     }
+     append(...rt);
+
+     if (ua?.getHighEntropyValues) {
+       const v = await ua.getHighEntropyValues(
+         ['architecture', 'bitness', 'fullVersionList']);
+       const b = v.fullVersionList.find(
+         x => !/Not.?A.?Brand/i.test(x.brand)
+       ) || v.fullVersionList[0];
+       append(
+         `Arch: ${v.architecture}`,
+         `Bitness: ${v.bitness}`,
+         `Browser: ${b.brand} ${b.version}`,
+       );
+     }
 
      import initHasher from "../multithreading-hasher.js";
 
@@ -352,15 +371,15 @@
        for (const r of rows) {
          const ratio = r.shaMs / r.directMs;
          html += `<tr>
-           <td>${r.sizeLabel}</td>
-           <td>${fmtMs(r.directMs)}</td>
-           <td><b>${fmtTimePerByte(r.directMs, r.numbytes)}</b></td>
-           <td>${fmtMs(r.shaMs)}</td>
-           <td>${fmtTimePerByte(r.shaMs, r.numbytes)}</b></td>
-           <td class="${cellClass(ratio)}"><b>${ratio.toFixed(2)}×</b></td>
-           <td class="dim">${r.hashIters}</td>
-           <td class="dim">${r.shaIters}</td>
-         </tr>`;
+        <td>${r.sizeLabel}</td>
+        <td>${fmtMs(r.directMs)}</td>
+        <td><b>${fmtTimePerByte(r.directMs, r.numbytes)}</b></td>
+        <td>${fmtMs(r.shaMs)}</td>
+        <td>${fmtTimePerByte(r.shaMs, r.numbytes)}</b></td>
+        <td class="${cellClass(ratio)}"><b>${ratio.toFixed(2)}×</b></td>
+        <td class="dim">${r.hashIters}</td>
+        <td class="dim">${r.shaIters}</td>
+      </tr>`;
        }
        html += "</table>";
        mainResultsEl.innerHTML = html;
@@ -386,11 +405,11 @@
              const ms = b3Baseline[si];
              const vsSha = shaBaseline[si] / ms;
              html += `<td class="${cellClass(vsSha)}">
-               <b>${fmtMs(ms)}</b><br>
-               ${fmtTimePerByte(ms, numbytes)}<br>
-               <span class="dim">${vsSha.toFixed(2)}× vs SHA</span><br>
-               <span class="dim">1T baseline</span>
-             </td>`;
+        <b>${fmtMs(ms)}</b><br>
+        ${fmtTimePerByte(ms, numbytes)}<br>
+        <span class="dim">${vsSha.toFixed(2)}× vs SHA</span><br>
+        <span class="dim">1T baseline</span>
+        </td>`;
              continue;
            }
 
@@ -404,28 +423,28 @@
            const vsSha = shaBaseline[si] / r.ms;
            const vs1T = b3Baseline[si] / r.ms;
            html += `<td class="${cellClass(vsSha)}">
-             <b>${fmtMs(r.ms)}</b><br>
-             ${fmtTimePerByte(r.ms, numbytes)}<br>
-             <span class="dim">${vsSha.toFixed(2)}× vs SHA</span><br>
-             <span class="dim">${vs1T.toFixed(2)}× vs 1T</span><br>
-             <span class="dim">${r.nodes} node${r.nodes === 1 ? '' : 's'}</span>
-           </td>`;
+          <b>${fmtMs(r.ms)}</b><br>
+          ${fmtTimePerByte(r.ms, numbytes)}<br>
+          <span class="dim">${vsSha.toFixed(2)}× vs SHA</span><br>
+          <span class="dim">${vs1T.toFixed(2)}× vs 1T</span><br>
+          <span class="dim">${r.nodes} node${r.nodes === 1 ? '' : 's'}</span>
+        </td>`;
          }
 
          const best = bestOf(candidates);
          const bestVsSha = shaBaseline[si] / best.ms;
          const bestVs1T = b3Baseline[si] / best.ms;
          html += `<td class="${cellClass(bestVsSha)}">
-           <b>${fmtMs(best.ms)}</b><br>
-           ${fmtTimePerByte(best.ms, numbytes)}<br>
-           <span class="dim">${bestVsSha.toFixed(2)}× vs SHA</span><br>
-           <span class="dim">${bestVs1T.toFixed(2)}× vs 1T</span><br>
-           <span class="dim">${
-             best.threadCount === 1
-               ? "best: 1T"
-               : `best: ${best.threadCount}T`
-           }</span>
-         </td></tr>`;
+          <b>${fmtMs(best.ms)}</b><br>
+          ${fmtTimePerByte(best.ms, numbytes)}<br>
+          <span class="dim">${bestVsSha.toFixed(2)}× vs SHA</span><br>
+          <span class="dim">${bestVs1T.toFixed(2)}× vs 1T</span><br>
+          <span class="dim">${
+            best.threadCount === 1
+            ? "best: 1T"
+            : `best: ${best.threadCount}T`
+            }</span>
+        </td></tr>`;
        }
 
        html += '</table></div></div>';
@@ -447,23 +466,23 @@
        for (const r of rows) {
          if (r.skip) {
            html += `<tr>
-             <td>${r.sizeLabel}</td>
-             <td>—</td><td>—</td><td>—</td>
-             <td>—</td><td>1T only</td><td>—</td><td>—</td>
-           </tr>`;
+            <td>${r.sizeLabel}</td>
+            <td>—</td><td>—</td><td>—</td>
+            <td>—</td><td>1T only</td><td>—</td><td>—</td>
+          </tr>`;
            continue;
          }
          const vsSha = r.shaMs / r.autoMs;
          const vs1T = r.directMs / r.autoMs;
          html += `<tr>
-           <td>${r.sizeLabel}</td>
-           <td>${fmtMs(r.autoMs)}</td>
-           <td><b>${fmtTimePerByte(r.autoMs, r.numbytes)}</b></td>
-           <td class="${cellClass(vsSha)}"><b>${vsSha.toFixed(2)}×</b></td>
-           <td><b>${vs1T.toFixed(2)}×</b></td>
-           <td>${r.totalNodes}</td>
-           <td class="dim">${r.autoIters}</td>
-         </tr>`;
+            <td>${r.sizeLabel}</td>
+            <td>${fmtMs(r.autoMs)}</td>
+            <td><b>${fmtTimePerByte(r.autoMs, r.numbytes)}</b></td>
+            <td class="${cellClass(vsSha)}"><b>${vsSha.toFixed(2)}×</b></td>
+            <td><b>${vs1T.toFixed(2)}×</b></td>
+            <td>${r.totalNodes}</td>
+            <td class="dim">${r.autoIters}</td>
+          </tr>`;
        }
        html += "</table>";
        plannerResultsEl.innerHTML = html;
